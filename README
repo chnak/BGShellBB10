@@ -1,0 +1,280 @@
+Chinese translation: README.zh.md
+
+Provides you with an ordinary terminal window, i.e. sh running on your BlackBerry BB10 and gives you 
+command line OpeSSH suite utilities. These utilities are just ports of what you use on any Linux/BSD 
+system so they provide (almost) the same functionality and accept the same parameters.
+
+DISCLAIMER: Utilities perform encryption/decryption that might be illegal in your country, it is your 
+responsibility to obey law.
+This is an experimental work (QT and BlackBerry BB10 Native development) which brings you an ordinary 
+shell terminal window which I was missing a lot being a *nix guy. For now just some basic commands 
+are available like ls, echo, uname (try what else you can find). The software is 'work in progress', 
+provided 'as is' and any comments are very welcome!
+
+This is a port of QTermWidget(http://qtermwidget.sourceforge.net/) to BB10 OS - many thanks to 
+Community for qtermwidget!
+
+List of features:
+    -- terminal window with following command line tools: ssh, scp, sftp, ssh-agent, ssh-keygen, ssh-add
+    -- soft keyboard for Alt+ and Ctrl+ key sequences
+    -- 中文输入法: pinyin IME running inside the terminal (Alt+Enter), 8230
+       characters (the 8105 of 通用规范汉字表 plus the GB2312 rest) and phrases, candidates learned while you use it
+    -- ssh tunnels (work even when the app minimized)
+    -- ssh over HTTP Proxy (working when installed in both Work and Personal space)
+    -- ssh works when the app is installed in Work space of BlackBerry Balance
+
+Read more on this project at http://bgmot.com/BGShellPlus
+
+Don't ask questions in Reviews section, they will not be answered. Instead please e-mail support@bgmot.com
+	
+Release notes:
+- 0.0.0.5 - the first Release
+
+- 0.0.0.6
+    -- read ~/.profile when starting
+
+- 0.0.0.600 - port to BB 10.0.9
+
+- 0.0.0.604
+    -- Font size adjusted to BB10.0.9.1103
+    
+- 0.0.0.605
+    -- Fixed Buttons responsiveness 
+    -- Fix keyboard type (Enter button now shows as Enter)
+
+- 0.0.0.606
+    -- now you can generate any CTRL+ codes just tap on the Ctrl+ soft button and then required code on 
+       virtual keyboard. - now this shell can run in background mode (when minimized) - perfect use 
+       case for tunneling your SMTP and IMAP traffic securely by means of ssh tunnels. All you need is 
+       to create needed tunnels in terminal window like :
+       ssh -p 2222 user@host.domain.eg -L 2225:your.mailserver:25 -L 2143:your.mailserver:143 etc etc. 
+       Then in BB10 mail account settings use for SMTP 127.0.0.1 port 2225 and 
+       for IMAP -127.0.0.1 port 2143. Of course it is possible to tunnel anything 
+       you want. Thanks for this great idea to Nick W.
+
+- 0.0.0.607
+    -- Added SSH connections using HTTP Proxy. When installed in Personal space of 
+       BlackBerry Balance then it reads proxy settings from your current connection. 
+       When installed in Work space it reads proxy settings pushed by your BES.
+       Just swipe down and check Use HTTP Proxy in Settings. BETA feature, feedback 
+       would be greatly appreciated, please e-mail to bgmot@tm-k.com.
+
+- 0.0.0.608
+    -- fixed little bug in Work perimeter
+    -- console Font Size option added
+    
+- 0.0.0.700
+    -- minor fixes for Fonts management
+
+- 0.0.0.6060 (version only for devices with physical keyboard)
+    -- port to devices with physical keyboard
+
+- 0.0.0.7070 (version only for devices with physical keyboard)
+    -- Fonts management 
+    -- SSH working with HTTP proxy (can be installed in Work perimeter of BlackBerry Balance)
+    -- virtual keyboard for SYM characters
+
+- 0.0.1.1
+    -- One single version for all types of devices
+    -- BlackBerry Passport supported now 
+    -- it is possible to run ssh, scp and sftp from any folder (fixed PATH)
+    -- Known bug: Shift Key on Passport sticks - you have to press it again to unshift
+
+- 0.0.1.2
+    -- Move menu bar to the bottom of the screen (too many people asked for that) 
+    -- Fix running when minimized (useful for tunnels)
+
+- 0.0.2.0
+    -- ssh-keygen, ssh-agent, ssh-add utilities added
+    -- more flexibility in choosing console font size
+
+- 0.0.3.0
+    -- Chinese pinyin input method: Alt+Enter (or Ctrl+Space) toggles it,
+       Term50's engine and dictionary run inside the widget - the shell gets
+       committed UTF-8, no system input panel involved (see below)
+    -- the CJK font is bundled and subset from the kit's Maple Mono NF CN, so
+       Chinese renders on a stock device without installing fonts
+    -- physical SYM key opens the Term50 symbol grid instead of the old
+       vk.png picture; Alt+Space is Tab again (Alt+Enter took over Tab)
+    -- space no longer takes the first candidate: while composing pinyin it
+       sends the typed letters as English (`Hello` -> `Hello `) and Enter
+       commits the highlighted candidate, so English needs no 中/EN toggle
+    -- - , [ = . ] only turn candidate pages when there is more than one;
+       with a single page they are ordinary punctuation again, so an English
+       sentence does not lose its commas
+
+## Key bindings (Term50-style, no soft-key bar)
+
+The old on-screen button bar (Ctrl+ / Tab / < / > / ^ / v / Esc) is gone: the
+terminal now uses the full screen height above the virtual keyboard, and the
+keys come from the physical keyboard plus a sticky "CTRL layer" ported from
+Term50's metamode scheme.
+
+### Shift is the Ctrl key
+
+BB10 phone keyboards (Q10 / Q30 / Passport / Classic) have **no cursor arrow
+keys** - the key printed with an up arrow is the **Shift** key, so that is the
+key to use as Ctrl:
+
+* **hold the RIGHT Shift + key** -> Ctrl+key, the real modifier behaviour:
+  `c`=Ctrl+C, `d`=Ctrl+D, `z`=Ctrl+Z, `l`=Ctrl+L, `[`=Ctrl+[, ...
+  (A-Z and `[ \ ] ^ _` all map to `key - 0x40`; arrows/Home/End/Delete/PgUp/PgDn
+  are sent in xterm form `ESC[1;5X`.)
+* **double-tap the RIGHT Shift** (within 500 ms, with nothing typed in between)
+  -> toggles the sticky CTRL layer; a green `CTRL` badge appears in the
+  bottom-right corner while it is armed.
+* the **left Shift stays a normal Shift** - it is never turned into Ctrl, so
+  uppercase typing and the BB10 shift/SYM workaround are untouched. Typing
+  capitals (`Shift`,`A`,`Shift`,`B`, ...) cannot arm the layer, because
+  any other key press cancels the pending double tap.
+* both Shift keys arrive as `Qt::Key_Shift`; left/right are told apart by the
+  QNX keycode (`KEYCODE_RIGHT_SHIFT`) carried in `nativeVirtualKey()` /
+  `nativeScanCode()`. If neither carries a keycode (both 0), the two keys
+  are indistinguishable and the double tap is accepted from either Shift. If a
+  device port reports something unexpected, arm the layer and press `?`: the
+  help overlay prints the last Shift `native`/`scan` keycode so the mapping
+  can be pinned down.
+
+Inside the CTRL layer:
+
+| key | action |
+|-----|--------|
+| `e` | Esc |
+| `s` | Ctrl+L (rescreen) |
+| `v` | paste clipboard |
+| `i` / `o` / `z` | font bigger / smaller / reset (saved to QSettings) |
+| `r` | reload settings from QSettings |
+| `?` | keybinding help overlay |
+| `h` `j` `k` `l` | left / down / up / right, stays in the layer |
+| arrows | keep moving, stays in the layer (external keyboards) |
+| anything else | Ctrl+&lt;key&gt; and leave the layer |
+
+### SYM: the Term50 symmenu overlay
+
+The physical **SYM** key pops up Term50's `main_symmenu` grid (see
+`symbolpanel.cpp`) - the same 19 symbols, in the same two rows, that Term50's
+`DEFAULT_SYMMENU_ENTRIES` / `DEFAULT_SYMMENU_ROW_LENS {10, 9}` define:
+
+```
+ ~    `    {    }    [    ]    <    >    ^    %
+ q    w    e    r    t    y    u    i    o    p
+
+ =    -    *    /    \    |    &    '    "
+ a    s    d    f    g    h    j    k    l
+```
+
+Every cell shows the glyph with the key that picks it in the corner (green),
+exactly like Term50's renderer. There are two ways to insert a symbol:
+
+* **tap the cell** (Q30 / Passport / Classic touchscreen), or
+* **press that key** - the grid owns the keyboard while it is up.
+
+SYM or Esc again closes it; any other key closes it and is swallowed, so a
+stray keystroke can never leak into the shell. The grid re-lays itself out on
+rotation and never resizes the terminal (no rescreen, unlike Term50).
+
+SYM is detected by its QNX keycode `0xF0D3` (`KEYCODE_BB_SYM_KEY`, Term50
+`src/terminal.h`) through `nativeVirtualKey()`/`nativeScanCode()`; firmware
+that reports SYM as a bare Escape keeps working through that fallback, since
+the phones have no Escape key of their own (Esc is `e` in the CTRL layer).
+This replaces the old `myvk` `vk.png` picture, which only *showed* the
+symbols and had to be dismissed by pressing a key.
+
+### 中文输入法: pinyin input inside the terminal
+
+BB10's own input panel is no help for a terminal (the pty needs the raw
+UTF-8, and Qt4 on BB10 has no input method plugin a full screen widget can
+drive), so the IME runs inside the widget, exactly like Term50's:
+
+* **Alt+Enter** (or **Ctrl+Space**) switches 中文 / EN. A green **中** badge
+  sits in the top left corner while it is on, and the state is remembered
+  across restarts.
+* **a-z** type pinyin, **Enter** takes the highlighted candidate, **1-8**
+  take the candidate with that number, **- , <** and **= . >** page — but
+  only while the strip really has more than one page. With a single page
+  they are plain punctuation: the letters typed so far go out first and the
+  shell then gets the `,` itself, so `hello, world` keeps its comma.
+  **Esc** drops the composition without sending anything.
+* **space** does not take a candidate: while composing it commits the
+  letters you typed as plain English plus a space (`Hello` -> `Hello `), so
+  typing an English word never needs a 中/EN toggle. With nothing being
+  composed it is the normal space. A key the engine cannot use
+  (punctuation, a function key) ends the composition the same way, with
+  the letters kept, so `Hello!` really sends `Hello!`.
+* the candidate strip along the bottom edge shows the current page:
+
+  ```
+  [中]  nihao   1 你好   2 你   3 尼   4 泥      1/1  < >
+  ```
+
+  Every candidate can be tapped as well, so the phone keyboard alone is
+  enough - no external keyboard needed.
+
+  On a **Q20 / Q10 / Q5 / Classic** (no touchscreen, a trackpad instead) the
+  trackpad drives the strip: left-right steps the green frame from candidate to
+  candidate, up-down turns the page, and a trackpad click commits the framed
+  one. The arrow keys on an external keyboard do the same. The steps are paced
+  like a key repeat (80 ms), because the trackpad streams one event per pixel.
+  While no composition is running the trackpad keeps its old job and sends
+  arrow keys to the shell.
+
+  A word candidate is two or three cells wide, so a page shows only as many as
+  fit; the rest of that page stays reachable with the number keys and the
+  paging keys.
+* whole words work, not just one character at a time: `nihao` -> 你好,
+  `zhongwen` -> 中文, `xianzai` -> 现在, and an unknown word falls back to
+  syllable by syllable (`woaini` -> 我爱你).
+* the candidate you pick is remembered (`$HOME/.term/cjk_ime_freq`), so the
+  characters you use most come first the next time - and the shipped order is
+  frequency ordered too (`tools/order-ime-dict.py`), otherwise typing `shi`
+  would start with 世 事 仕 似 instead of 是.
+
+The engine is Term50's `cjk_ime.c` / `cjk_ime_dict.inc`, copied in unchanged
+(only `extern "C"` was added to the header so C++ can call it) - 8230 single
+characters plus ~28k words.
+
+8105 is every character of 《通用规范汉字表》. GB2312, what older phones and PCs
+could produce, has 125 characters that table dropped - mostly radicals people
+do type (氵 扌 艹 讠 纟 钅 饣 辶 阝 灬 忄 疒 礻 衤) and a few odd ones (磺 矽 捱
+搿 渖 飚 齄). `tools/add-gb2312-chars.py` adds them with the readings from the
+pinyin-data dump in `tools/cache`, so all 6763 GB2312 hanzi can now be typed
+and every one of them has a glyph.
+
+Known hole: 273 of the 8105 are 繁体/rare characters outside the BMP (Ext-A,
+Ext-B/C, e.g. 㑇 䁖 𠅤) - Maple Mono has no glyph for those blocks at all, so
+picking one from the strip writes a character that shows up as a box. They are
+last in their reading, and no phrase uses them. Rendering needs glyphs the device stock fonts do
+not have, so `main.cpp` registers the bundled `assets/bgscjk.ttf` (a subset of
+the kit's Maple Mono NF CN covering the dictionary) at start up and uses that
+family for the terminal: Chinese is exactly two cells wide, as `Screen.cpp`
+assumes. Adjust the strip in `imepanel.cpp`, the key mapping in
+`TerminalDisplay::handleImeKey`.
+
+The engine is plain C with no Qt in it, so its behaviour is tested on the build
+host: `tools/test-cjk-ime.sh` builds `cjk_ime.c` with the host compiler and
+checks the words, the candidate order, the paging, the commit and the keys that
+have to keep reaching the shell (21 checks). Run it after touching the
+dictionary - `tools/order-ime-dict.py` and `tools/gen-ime-data.py` (font
+subset) are the other two tools worth re-running.
+
+Two widget-level checks run on the host as well, with no NDK involved:
+`tests/run-shift-layer-check.sh` (left Shift stays Shift, the Ctrl layer comes
+from the right one) and `tests/run-ime-page-check.sh` (when `,` `.` `-` `[` `]`
+`=` page the candidates and when they stay plain punctuation). Both compile code
+lifted verbatim out of `TerminalDisplay.cpp`, so they cannot drift away from
+what ships.
+
+Other chords: **Alt+Enter = 中文/EN**, **Ctrl+Space = the same**,
+**Alt+Space = Tab**, **Shift+Alt+key = Ctrl+key**, and double-tapping the
+physical Right arrow also toggles the layer (external keyboards only - the
+phones have no arrow keys). Term50 puts `ime_toggle` on Alt+Space; here it
+moved to Alt+Enter and Alt+Space went back to Tab, because the phone
+keyboards have no Tab key and completion matters more.
+
+Term50 bindings with no BBShell equivalent are intentionally absent:
+`tab_new/tab_next/tab_prev/tab_close` (single-session app), `url_pick`,
+`reload_config` (there is no `.term.lua`; `r` re-reads QSettings instead),
+and the Lua/termctl surfaces.
+
+Tunables: `META_DOUBLE_TAP_MS` and `META_DEFAULT_FONT_SIZE` at the top of the
+key-layer block in `TerminalDisplay.cpp`.

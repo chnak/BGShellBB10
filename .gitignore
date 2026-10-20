@@ -1,0 +1,29 @@
+# ── BB10 构建产物 ───────────────────────────────────────────────
+# qmake 生成的 Makefile 与目标目录；_Makefile / _BGShellBB10.pro 是源模板，必须入库
+arm/
+Makefile
+Makefile.Debug
+Makefile.Release
+.qmake.stash
+*.o
+*.d
+.foliko
+.claude
+moc_*.cpp
+moc_*.h
+*.moc
+Device-Debug/
+Device-Release/
+Simulator-Debug/
+Simulator-Release/
+
+# ── 打包产物 ───────────────────────────────────────────────────
+# bar-descriptor.xml 是 blackberry-nativepackager 的输入，要入库；
+# assets/.assets.index 由打包器生成
+*.bar
+*.bar.bak
+assets/.assets.index
+
+# ── 本机临时文件 ───────────────────────────────────────────────
+.tmp/
+*.log
