@@ -25,10 +25,13 @@
 #include <QtCore/QDir>
 #include <QtCore/QFile>
 #include <QtGui/QFontDatabase>
+#include <QtCore/QSettings>
 #include <fcntl.h>
+#include <sys/stat.h>
 #include "qtermwidget.h"
 #include "mysystemmenu.h"
 #include "mymainwindow.h"
+#include "uitheme.h"
 #include <bps/virtualkeyboard.h>
 #include "mydevicetype.h"
 
@@ -213,10 +216,23 @@ int main(int argc, char *argv[])
         fprintf(stderr, "Can't determine my current folder, terminating");
         exit(-1);
     }
-    QString newPath = QString(cwd) + "/app/native:" + oldPath;
+    // app/native/bin holds the bundled ssh suite (ssh/scp/sftp/ssh-keygen),
+    // app/native itself stays first for anything dropped there by hand.
+    QString newPath = QString(cwd) + "/app/native/bin:" + QString(cwd) + "/app/native:" + oldPath;
     qputenv("PATH", newPath.toAscii().data());
     newPath = QString(cwd) + "/app/native/lib:/usr/lib/qt4/lib:" + oldLDPath;
     qputenv("LD_LIBRARY_PATH", newPath.toAscii().data());
+
+    // The bundled ssh suite ships as assets; some installers drop the exec bit
+    // from files inside a .bar, so make sure the tools stay runnable.
+    {
+        static const char *tools[] = { "ssh", "scp", "sftp", "ssh-keygen" };
+        for (int i = 0; i < (int)(sizeof(tools) / sizeof(tools[0])); ++i) {
+            const QString tool = QString(cwd) + "/app/native/bin/" + tools[i];
+            if (QFile::exists(tool))
+                chmod(tool.toAscii().data(), 0755);
+        }
+    }
     
 	// Init file descriptors opening proper devices
 	masterFdG = ::open("/dev/ptyp1", O_RDWR);
@@ -260,6 +276,11 @@ int main(int argc, char *argv[])
 
     gTerminalFontFamily = installBundledFont();
 
+    // One visual language for every piece of chrome: menu, settings, command
+    // panel, dialogs (see uitheme.h). Applied after the bundled font is
+    // registered so UI text and terminal text use the same family.
+    UiTheme::apply(app);
+
     mainWindow = new CMyMainWindow();
     QRect r = QApplication::desktop()->screenGeometry(0);
     mainWindow->resize(r.width()+1, r.height()+1);
@@ -274,11 +295,22 @@ int main(int argc, char *argv[])
     font.setStyle(QFont::StyleNormal);
     font.setWeight(QFont::Normal);
     console->setTerminalFont(font);
+    // "Midnight": the app's own colour table, matched to the UI accent.
+    console->setColorScheme(COLOR_SCHEME_BGSHELL);
 
     // We start the app with shown keyboard (it does not make any harm for devices with physical keyboard)
 	virtualkeyboard_change_options(VIRTUALKEYBOARD_LAYOUT_DEFAULT, VIRTUALKEYBOARD_ENTER_DEFAULT);
 	console->setGeometry(0, 0, r.width()+1, r.height()-nKBHeight);
     console->setScrollBarPosition(QTermWidget::ScrollBarRight);
+
+    // Scrollback depth is a user setting (设置 -> 回滚缓冲行数); 2000 lines
+    // matches what the widget used before the setting existed.
+    {
+        QSettings settings;
+        int nHistory = settings.value("HistorySize", 2000).toInt();
+        if (nHistory > 0)
+            console->setHistorySize(nHistory);
+    }
 
     // Our system menu
     SystemMenu = new CMySystemMenu(mainWindow);

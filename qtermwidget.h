@@ -28,7 +28,8 @@ struct TermWidgetImpl;
 
 enum COLOR_SCHEME {     COLOR_SCHEME_WHITE_ON_BLACK	= 1,
 		        COLOR_SCHEME_GREEN_ON_BLACK,
-		        COLOR_SCHEME_BLACK_ON_LIGHT_YELLOW };
+		        COLOR_SCHEME_BLACK_ON_LIGHT_YELLOW,
+		        COLOR_SCHEME_BGSHELL };   // "Midnight", the app default
 
 class QTermWidget : public QWidget
 {
@@ -88,6 +89,9 @@ public:
     // candidate strip consumed the movement / the click.
     bool imeTrackpadStep(int dx, int dy);
     bool imeTrackpadClick();
+
+    // Quick commands / saved SSH hosts (system menu -> "Cmds").
+    void toggleCommandPanel();
             
 signals:
     void finished();

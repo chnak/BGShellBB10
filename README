@@ -15,10 +15,13 @@ This is a port of QTermWidget(http://qtermwidget.sourceforge.net/) to BB10 OS - 
 Community for qtermwidget!
 
 List of features:
-    -- terminal window with following command line tools: ssh, scp, sftp, ssh-agent, ssh-keygen, ssh-add
+    -- terminal window with ssh, scp, sftp and ssh-keygen (bundled in app/native/bin,
+       their libraries in app/native/lib)
     -- soft keyboard for Alt+ and Ctrl+ key sequences
     -- 中文输入法: pinyin IME running inside the terminal (Alt+Enter), 8230
        characters (the 8105 of 通用规范汉字表 plus the GB2312 rest) and phrases, candidates learned while you use it
+    -- ssh keeps itself alive (30 s heartbeat) and a dropped session shows a
+       reconnect strip at the top of the screen
     -- ssh tunnels (work even when the app minimized)
     -- ssh over HTTP Proxy (working when installed in both Work and Personal space)
     -- ssh works when the app is installed in Work space of BlackBerry Balance
@@ -102,6 +105,123 @@ Release notes:
     -- - , [ = . ] only turn candidate pages when there is more than one;
        with a single page they are ordinary punctuation again, so an English
        sentence does not lose its commas
+
+- 0.0.3.1
+    -- Space and Enter swapped: **Space** takes the highlighted candidate
+       (was Enter), **Enter** sends the typed letters as English (was Space)
+    -- Enter appends nothing - no space, no newline; type the English word,
+       then a second Enter (nothing composing) runs the line
+    -- help overlay and both READMEs updated to match
+
+- 0.0.3.3
+    -- touch gestures: long press selects the line and opens a copy/paste
+       menu (drag after the press to grow the selection), two fingers scroll
+       the scrollback, pinch changes the font size and remembers it
+    -- first connection to an unknown host no longer stops at the
+       fingerprint question: ssh runs with StrictHostKeyChecking=accept-new
+    -- the key-binding help is now a scrollable window instead of a message
+       box that cut off the bottom of the text
+
+- 0.0.3.4
+    -- ssh keeps the link alive: ServerAliveInterval=30,
+       ServerAliveCountMax=3, TCPKeepAlive=yes, so a phone that sleeps no
+       longer drops the session after a minute of silence
+    -- a dropped connection raises a thin strip along the top with a 重连
+       button that re-runs the very same ssh command (a stored password is
+       re-armed); typing anything dismisses it
+    -- pasting text that contains line breaks asks first: paste as-is (runs
+       every line), join into one line, or cancel - cancel is the default, so
+       a stray Enter can never execute anything
+    -- scrollback depth is a setting now (500 / 1000 / 2000 / 5000 / 10000);
+       applied at startup and to the running session
+
+- 0.0.3.2
+    -- quick commands / SSH hosts panel (swipe-down menu -> Cmds / SSH)
+    -- a command can be run or only inserted on the command line; a few
+       samples (ls -l, df -h, ps, ...) are seeded on first start
+    -- saved hosts keep user / host / port / key / password; the password is
+       typed at the pty when ssh asks for it (once, 30 s timeout)
+    -- the password is only XOR+Base64 obfuscated, not encrypted; keys are
+       the recommended way
+
+## Quick commands and SSH hosts (swipe-down menu -> Cmds / SSH)
+
+The swipe-down menu now has two buttons: **设置** (settings) / **命令 / SSH**.
+All on-screen UI text (menu, settings window, key-binding help) is in Chinese; the
+donations button and its in-app purchase code have been removed.
+
+### Commands
+
+* Tap a row to select it, then **Run** (text + Enter) or **Insert** (text only,
+  so it can still be edited). Double-tap a row to edit it; **Add** / **Delete**
+  manage the list.
+* A few samples are seeded on the first start (`ls -l`, `df -h`, `ps`,
+  `ifconfig`, `uname -a`) - delete what you do not need.
+* The text is written straight into the pty, so it behaves exactly like typing:
+  it is echoed and lands in the shell history.
+
+### SSH hosts
+
+* Name / user / host / port / key / password. **Connect** is the same as typing
+  `ssh -o StrictHostKeyChecking=accept-new -p <port> -i <key> user@host` and
+  Enter. The flag is what removes the `Are you sure you want to continue
+  connecting (yes/no)?` step on a first connection: a new host is accepted and
+  recorded in `data/.ssh/known_hosts`, while a **changed** key is still rejected.
+* **Password**: when one is saved, the widget watches the pty output and answers
+  the first `password:` prompt (30 s window), then forgets it.
+
+### What saving a password really means
+
+BB10 exposes no system keychain to third-party apps, so the password lives in
+QSettings in the app's private data dir (key `SshHosts`) and is only XOR+Base64
+obfuscated - **not encrypted**. Anyone with root, a backup of the app data or
+the device unlocked can recover it.
+
+Keys are therefore the recommended way:
+
+```sh
+ssh-keygen -t ed25519 -f data/.ssh/id_ed25519      # bundled
+```
+
+ssh-agent / ssh-add are not bundled (only ssh, scp, sftp and ssh-keygen are);
+a key without a passphrase works directly, a protected one asks every time.
+
+Put the key path in the host entry and leave the password empty; ssh will ask
+when it really needs a passphrase.
+
+### Bundled ssh suite
+
+ssh / scp / sftp / ssh-keygen ship inside the bar and land in the app folder:
+
+```
+app/native/bin/ssh  scp  sftp  ssh-keygen      ~6.9 MB
+app/native/lib/libcrypto.so.3  libz.so.1      ~4.0 MB
+```
+
+* `main.cpp` prepends `app/native/bin` to PATH and re-applies the exec bit to the
+  four binaries; `LD_LIBRARY_PATH` already contains `app/native/lib`.
+* BB10 only has `libcrypto.so.2` / `libz.so.2`, different names from the `.so.3` /
+  `.so.1` shipped here, so nothing shadows a system library - and openssh asks
+  for exactly those two names, which is why they have to travel with the app.
+* The price is a 6.4 MB -> 11.3 MB bar. Do not want it? Drop the `sshbin` assets
+  from `bar-descriptor.xml` and repackage.
+
+## Touch gestures
+
+The display handles finger input itself, so nothing has to be selected with a
+long-press-then-release dance on a 3.1" screen:
+
+| gesture | what it does |
+|---|---|
+| tap | puts the keyboard focus back on the terminal |
+| long press (0.45 s) | selects the whole line under the finger and opens a small menu: **复制本行** / **复制选中文字** / **复制可见屏幕** / **粘贴** |
+| long press + drag | grows the selection to an arbitrary range; the menu item **复制选中文字** copies exactly that |
+| two fingers, drag up/down | walks the scrollback one line per line-height |
+| two fingers, pinch | font size, 10-60 px, applied immediately and stored in QSettings |
+
+Copied text is trimmed of the blank padding the screen carries, so pasting into
+an editor or a shell does not leave trailing spaces. The pinch changes the same
+`FontSize` setting as the drop-down in Settings, so the two never disagree.
 
 ## Key bindings (Term50-style, no soft-key bar)
 
@@ -189,16 +309,18 @@ drive), so the IME runs inside the widget, exactly like Term50's:
 * **Alt+Enter** (or **Ctrl+Space**) switches 中文 / EN. A green **中** badge
   sits in the top left corner while it is on, and the state is remembered
   across restarts.
-* **a-z** type pinyin, **Enter** takes the highlighted candidate, **1-8**
+* **a-z** type pinyin, **Space** takes the highlighted candidate, **1-8**
   take the candidate with that number, **- , <** and **= . >** page — but
   only while the strip really has more than one page. With a single page
   they are plain punctuation: the letters typed so far go out first and the
   shell then gets the `,` itself, so `hello, world` keeps its comma.
   **Esc** drops the composition without sending anything.
-* **space** does not take a candidate: while composing it commits the
-  letters you typed as plain English plus a space (`Hello` -> `Hello `), so
-  typing an English word never needs a 中/EN toggle. With nothing being
-  composed it is the normal space. A key the engine cannot use
+* **Enter** does not take a candidate: while composing it commits the
+  letters you typed as plain English (`Hello` -> `Hello`), so typing an
+  English word never needs a 中/EN toggle. Nothing is appended - no space
+  and no newline - so the composition simply ends and a second Enter (with
+  nothing being composed) runs the line. With nothing being composed it is
+  the normal Enter. A key the engine cannot use
   (punctuation, a function key) ends the composition the same way, with
   the letters kept, so `Hello!` really sends `Hello!`.
 * the candidate strip along the bottom edge shows the current page:

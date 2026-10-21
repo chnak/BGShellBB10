@@ -16,7 +16,7 @@ Device-Debug/
 Device-Release/
 Simulator-Debug/
 Simulator-Release/
-
+.env
 # ── 打包产物 ───────────────────────────────────────────────────
 # bar-descriptor.xml 是 blackberry-nativepackager 的输入，要入库；
 # assets/.assets.index 由打包器生成

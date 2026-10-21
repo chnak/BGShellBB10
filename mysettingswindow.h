@@ -19,9 +19,13 @@ public:
     QCheckBox *cbxProxyOn;
     QLabel *lblFontSample;
     QToolButton *btnClose;
-    
+
+protected:
+    void paintEvent(QPaintEvent *event);
+
 private slots:
     void on_cbFontSize_currentIndexChanged(const QString &);
+    void on_cbHistory_currentIndexChanged(const QString &);
     void on_btnClose_clicked();
 };
 

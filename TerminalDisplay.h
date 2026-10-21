@@ -27,6 +27,7 @@
 
 // Qt
 #include <QtGui/QColor>
+#include <QtCore/QByteArray>
 #include <QtCore/QPointer>
 #include <QtGui/QWidget>
 
@@ -42,12 +43,14 @@ class QDropEvent;
 class QLabel;
 class CSymbolPanel;
 class CImePanel;
+class CCommandPanel;
 class QTimer;
 class QEvent;
 class QFrame;
 class QGridLayout;
 class QKeyEvent;
 class QScrollBar;
+class QTouchEvent;
 class QShowEvent;
 class QHideEvent;
 class QWidget;
@@ -383,6 +386,12 @@ public:
     bool imeTrackpadStep(int dx, int dy);
     bool imeTrackpadClick();
 
+    // Quick commands / saved SSH hosts. The overlay is opened from the system
+    // menu; commands and the ssh command line are written straight into the
+    // pty, so they behave exactly like typing (editable, shell history, ...).
+    void toggleCommandPanel();
+    void sendToShell(const QByteArray &bytes);
+
     /**
      * Specified whether anti-aliasing of text in the terminal display
      * is enabled or not.  Defaults to enabled.
@@ -431,6 +440,15 @@ public:
     static bool HAVE_TRANSPARENCY;
 
 public slots:
+
+    // Quick command panel
+    void onQuickCommand(const QString &command, bool run);
+    void runSshConnection(const QString &user, const QString &host, int port,
+                          const QString &identity, const QString &password);
+    // Output from the pty: used to answer the ssh password prompt when a
+    // saved host supplied one.
+    void onSessionOutput(const QString &text);
+    void clearPendingSshPassword();
 
     /** 
      * Causes the terminal display to fetch the latest character image from the associated
@@ -537,6 +555,10 @@ signals:
 protected:
     virtual bool event( QEvent * );
 
+    // Finger gestures: long press = line selection + copy/paste menu,
+    // two fingers = pinch to zoom or drag to scroll the scrollback.
+    virtual void touchEvent( QTouchEvent * );
+
     virtual void paintEvent( QPaintEvent * );
 
     virtual void showEvent(QShowEvent*);
@@ -591,10 +613,13 @@ protected slots:
 private slots:
 
     void swapColorTable();
+    void onTouchLongPress();  // finger held down: select the line, show the menu
     void tripleClickTimeout();  // resets possibleTripleClick
     void onSymbolChosen(const QString &text);
     void onImeCandidateChosen(int index);
     void onImePageRequested(int delta);
+    void onDisconnectReconnect();   // "重连" on the dropped-connection banner
+    void onDisconnectDismiss();     // "x" on the same banner
 
 private:
 
@@ -747,8 +772,47 @@ private:
     bool          _imeOn;      // pinyin input active (Alt+Enter toggles)
     cjk_ime_t*    _ime;        // pinyin engine, created lazily
     CImePanel*    _imePanel;   // candidate strip, created lazily
-    QString       _imeRaw;     // letters as typed (case kept), flushed by Space
+    QString       _imeRaw;     // letters as typed (case kept), flushed by Enter
     QLabel*       _imeBadge;   // "中" indicator while the IME is on
+    CCommandPanel* _cmdPanel;  // quick commands / ssh hosts, created lazily
+    QString       _sshPendingPwd; // password waiting for the ssh prompt
+    QString       _sshTail;       // last output chars, catches split prompts
+    QTimer*       _sshPwdTimer;   // gives up waiting after a while
+    void sendPastedText(const QString &text);   // the actual paste, after the guard
+
+    // -- dropped connection ----------------------------------------------
+    QString       _lastSshCmd;      // the command that started the session
+    QString       _lastSshUser;
+    QString       _lastSshHost;
+    QString       _lastSshIdentity;
+    QString       _lastSshPassword;
+    int           _lastSshPort;
+    QString       _dcTail;          // recent output, scanned for ssh farewells
+    bool          _dcShown;         // banner already up, do not re-detect
+    QWidget*      _dcBanner;        // "连接已断开 / 重连", created lazily
+    QLabel*       _dcLabel;
+    void buildDisconnectBanner();
+    void layoutDisconnectBanner();
+    void showDisconnectBanner();
+    void hideDisconnectBanner();
+
+    // -- touch gesture state --
+    QTimer*       _tsLongTimer;   // fires when a finger stays put
+    int           _tsMode;        // 0 none, 1 one finger, 2 two fingers
+    bool          _tsMoved;       // the single finger travelled too far for a tap
+    bool          _tsLongFired;   // long press already selected + opened the menu
+    QPoint        _tsStart;       // where the finger came down
+    qreal         _tsPinchBase;   // finger distance when the pinch started
+    int           _tsPinchPx;     // font pixel size at that moment
+    int           _tsPinchCur;    // last applied size, avoids redundant re-layouts
+    int           _tsTwoMode;     // 0 undecided, 1 scrolling, 2 zooming
+    qreal         _tsBaseY;       // average finger Y when the gesture started
+    qreal         _tsLastY;       // average finger Y at the previous move
+    qreal         _tsScrollAcc;   // sub-line scrolling remainder
+    void selectLineAt( const QPoint& pos, int* absLine );
+    void extendTouchSelection( const QPoint& pos );
+    void showTouchMenu( const QPoint& pos );
+    void copySelectionToClipboard();
     void handleMetaKey(QKeyEvent* event);
 
 //    KMenu* _drop;

@@ -95,6 +95,11 @@ QTermWidget::QTermWidget(int startnow, QWidget *parent)
     
     init();
 
+    // A saved SSH host may carry a password: the display answers the prompt
+    // from the pty output, so it needs to see everything the shell prints.
+    connect(m_impl->m_session, SIGNAL(receivedData(QString)),
+            m_impl->m_terminalDisplay, SLOT(onSessionOutput(QString)));
+
     if (startnow && m_impl->m_session) {
     	m_impl->m_session->run();
     }
@@ -177,6 +182,9 @@ void QTermWidget::setColorScheme(int scheme)
 	case COLOR_SCHEME_BLACK_ON_LIGHT_YELLOW:
 		m_impl->m_terminalDisplay->setColorTable(blackonlightyellow_color_table);
 		break;
+	case COLOR_SCHEME_BGSHELL:
+		m_impl->m_terminalDisplay->setColorTable(bgshell_color_table);
+		break;
 	default: //do nothing
 	    break;
     };
@@ -207,6 +215,11 @@ void QTermWidget::setScrollBarPosition(ScrollBarPosition pos)
 void QTermWidget::sendText(QString &text)
 {
     m_impl->m_session->sendText(text); 
+}
+
+void QTermWidget::toggleCommandPanel()
+{
+    m_impl->m_terminalDisplay->toggleCommandPanel();
 }
 
 bool QTermWidget::imeTrackpadStep(int dx, int dy)

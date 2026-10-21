@@ -26,6 +26,7 @@
 
 // Own
 #include "TerminalDisplay.h"
+#include "cmdpanel.h"
 
 // Qt
 #include <QtGui/QApplication>
@@ -39,11 +40,18 @@
 #include <QtGui/QMessageBox>
 #include <QtCore/QFile>
 #include <QtGui/QGridLayout>
+#include <QtGui/QPlainTextEdit>
+#include <QtGui/QPushButton>
+#include <QtGui/QDialog>
+#include <QtGui/QVBoxLayout>
 #include <QtGui/QLabel>
 #include <QtGui/QLayout>
 #include <QtGui/QPainter>
 #include <QtGui/QPixmap>
 #include <QtGui/QScrollBar>
+#include <QtGui/QMenu>
+#include <QtGui/QTouchEvent>
+#include <QtCore/QLineF>
 #include <QtGui/QStyle>
 #include <QtCore>
 #include <QtGui>
@@ -64,6 +72,7 @@
 #include "symbolpanel.h"
 #include "imepanel.h"
 #include "mydevicetype.h"
+#include "uitheme.h"
 extern int masterFdG;
 extern bool bCtrlFlag;
 extern bool bShiftFlag;
@@ -307,6 +316,23 @@ TerminalDisplay::TerminalDisplay(QWidget *parent)
 ,_ime(0)
 ,_imePanel(0)
 ,_imeBadge(0)
+,_cmdPanel(0)
+,_sshPwdTimer(0)
+,_lastSshPort(22)
+,_dcShown(false)
+,_dcBanner(0)
+,_dcLabel(0)
+,_tsLongTimer(0)
+,_tsMode(0)
+,_tsMoved(false)
+,_tsLongFired(false)
+,_tsPinchBase(0)
+,_tsPinchPx(0)
+,_tsPinchCur(0)
+,_tsTwoMode(0)
+,_tsBaseY(0)
+,_tsLastY(0)
+,_tsScrollAcc(0)
 {
   // terminal applications are not designed with Right-To-Left in mind,
   // so the layout is forced to Left-To-Right
@@ -335,6 +361,9 @@ TerminalDisplay::TerminalDisplay(QWidget *parent)
 //  QCursor::setAutoHideCursor( this, true );
   
   setUsesMouse(true);
+  // Take finger input ourselves: a tap focuses, a long press selects the line
+  // and offers copy/paste, two fingers pinch-zoom or scroll the scrollback.
+  setAttribute(Qt::WA_AcceptTouchEvents, true);
   setColorTable(whiteonblack_color_table); 
 //  setColorTable(blackonlightyellow_color_table); 
   setMouseTracking(true);
@@ -1456,6 +1485,9 @@ void TerminalDisplay::resizeEvent(QResizeEvent*)
                      rect().height() - _metaBadge->height() - 8);
     _metaBadge->raise();
   }
+
+  if (_dcBanner && _dcBanner->isVisible())
+    layoutDisconnectBanner();
 }
 
 void TerminalDisplay::propagateSize()
@@ -2288,19 +2320,59 @@ void TerminalDisplay::emitSelection(bool useXselection,bool appendReturn)
   if ( !_screenWindow ) 
       return;
 
-  // Paste Clipboard by simulating keypress events
   QString text = QApplication::clipboard()->text(useXselection ? QClipboard::Selection :
                                                                  QClipboard::Clipboard);
   if(appendReturn)
     text.append("\r");
-  if ( ! text.isEmpty() )
-  {
-    text.replace("\n", "\r");
-    QKeyEvent e(QEvent::KeyPress, 0, Qt::NoModifier, text);
-    emit keyPressedSignal(&e); // expose as a big fat keypress event
-    
-    _screenWindow->clearSelection();
+  if ( text.isEmpty() )
+      return;
+
+  // A paste that carries hard line breaks is handed to the shell line by
+  // line, so every line runs the moment it arrives. That is almost never
+  // what a stray tap on "Paste" is meant to do, so ask first. The prompt
+  // also offers to join the lines, which is what most copy-from-a-web-page
+  // pastes actually want.
+  if (text.contains('\n') || text.contains('\r')) {
+    int breaks = text.count('\n') + text.count('\r') - text.count(QString("\r\n"));
+    QMessageBox box(this);
+    box.setWindowTitle(QString::fromUtf8("粘贴多行"));
+    box.setText(QString::fromUtf8("内容包含 %1 个换行，原样粘贴会逐行执行。").arg(breaks));
+    box.setIcon(QMessageBox::Warning);
+    QPushButton *bRaw  = box.addButton(QString::fromUtf8("原样粘贴"), QMessageBox::AcceptRole);
+    QPushButton *bJoin = box.addButton(QString::fromUtf8("合并成一行"), QMessageBox::ActionRole);
+    QPushButton *bNo   = box.addButton(QString::fromUtf8("取消"), QMessageBox::RejectRole);
+    box.setDefaultButton(bNo);      // a stray Enter must never run anything
+    box.exec();
+
+    if (box.clickedButton() == bJoin) {
+      text.replace(QString("\r\n"), QString(" "));
+      text.replace('\n', ' ');
+      text.replace('\r', ' ');
+      text = text.trimmed();
+      if (appendReturn)
+        text.append('\r');
+    } else if (box.clickedButton() != bRaw) {
+      setFocus();
+      return;
+    }
   }
+
+  sendPastedText(text);
+}
+
+void TerminalDisplay::sendPastedText(const QString &text)
+{
+  if ( !_screenWindow || text.isEmpty() )
+      return;
+
+  QString out = text;
+  out.replace(QString("\r\n"), QString("\r"));   // CRLF from web copies
+  out.replace("\n", "\r");
+  QKeyEvent e(QEvent::KeyPress, 0, Qt::NoModifier, out);
+  emit keyPressedSignal(&e); // expose as a big fat keypress event
+
+  _screenWindow->clearSelection();
+  setFocus();
 }
 
 void TerminalDisplay::setSelection(const QString& t)
@@ -2467,50 +2539,90 @@ void TerminalDisplay::applyFontPixelSize(int px)
 void TerminalDisplay::showBindingHelp()
 {
 	QString help;
-	help += "Shift is the Ctrl key on the physical keyboard\n";
-	help += "(BB10 phones have no arrow keys - the key with the\n";
-	help += " up arrow on it is Shift)\n\n";
-	help += "  hold RIGHT Shift + <key> -> Ctrl+<key>\n";
-	help += "      c=Ctrl+C  d=Ctrl+D  z=Ctrl+Z  l=Ctrl+L\n";
-	help += "  double-tap RIGHT Shift   -> sticky CTRL layer\n";
-	help += "  (nothing typed in between)                  \n";
-	help += "  left Shift always stays a normal Shift\n\n";
-	help += "Inside the CTRL layer:\n";
-	help += "  e   Esc                s   Ctrl+L (rescreen)\n";
-	help += "  v   paste clipboard    ?   this help\n";
-	help += "  i   font bigger        o   font smaller\n";
-	help += "  z   font reset         r   reload settings\n";
-	help += "  h/j/k/l   left/down/up/right (stay in layer)\n";
-	help += "  any other key -> Ctrl+<key>, then leave\n\n";
-	help += "SYM = symbol grid (tap a cell or press its letter)\n";
-	help += "      q~ w` e{ r} t[ y] u< i> o^ p%\n";
-	help += "      a= s- d* f/ g\\ h| j& k' l\"\n\n";
-	help += "Alt+Enter = 中文/EN input method   Alt+Space = Tab\n";
-	help += "Ctrl+Space = the same input method toggle\n";
-	help += "Shift+Alt+<key> = Ctrl+<key>\n";
-	help += "Double-tap the Right arrow also toggles the layer\n";
-	help += "(external keyboards only)\n\n";
-	help += "Pinyin IME (Alt+Enter, 中 badge at the top left):\n";
-	help += "  a-z     type pinyin (words too: nihao -> 你好)\n";
-	help += "  1-8     pick a candidate   Enter  take highlighted\n";
-	help += "  = . >   next page          - , <  previous page\n";
-	help += "          (only when the strip has a second page)\n";
-	help += "  tap     a candidate / < > arrow on the strip\n";
-	help += "  space   commit the letters as English (no toggle)\n";
-	help += "  Esc     drop the composition (nothing is sent)\n";
-	help += "  trackpad (Q20/Q10/Q5/Classic): left-right picks a\n";
-	help += "           candidate, up-down pages, click commits it\n\n";
-	help += QString("font: %1   input method: %2 (font is bundled, not installed)\n\n")
-	         .arg(gTerminalFontFamily.isEmpty() ? QString("Courier New - no CJK glyphs found")
+	help += QString::fromUtf8("实体键盘上 Shift 就是 Ctrl 键\n");
+	help += QString::fromUtf8("（BB10 手机没有方向键，印着上箭头的那个键就是 Shift）\n\n");
+	help += QString::fromUtf8("  按住右 Shift + <键> -> Ctrl + <键>\n");
+	help += QString::fromUtf8("      c=Ctrl+C  d=Ctrl+D  z=Ctrl+Z  l=Ctrl+L\n");
+	help += QString::fromUtf8("  双击右 Shift        -> 锁定 CTRL 层\n");
+	help += QString::fromUtf8("      （中间不能输入任何字符）\n");
+	help += QString::fromUtf8("  左 Shift 始终是普通 Shift\n\n");
+	help += QString::fromUtf8("CTRL 层内：\n");
+	help += QString::fromUtf8("  e    Esc               s   Ctrl+L（重画屏幕）\n");
+	help += QString::fromUtf8("  v    粘贴剪贴板        ?   本帮助\n");
+	help += QString::fromUtf8("  i    字体变大          o   字体变小\n");
+	help += QString::fromUtf8("  z    字体复原          r   重载设置\n");
+	help += QString::fromUtf8("  h/j/k/l   左/下/上/右（仍留在层内）\n");
+	help += QString::fromUtf8("  其它键 -> Ctrl+<键>，随后退出该层\n\n");
+	help += QString::fromUtf8("SYM = 符号面板（点格子，或按对应字母）\n");
+	help += QString::fromUtf8("      q~ w` e{ r} t[ y] u< i> o^ p%\n");
+	help += QString::fromUtf8("      a= s- d* f/ g\\ h| j& k' l\"\n\n");
+	help += QString::fromUtf8("Alt+Enter = 中文/EN 输入法   Alt+Space = Tab\n");
+	help += QString::fromUtf8("Ctrl+Space = 同样的输入法开关\n");
+	help += QString::fromUtf8("Shift+Alt+<键> = Ctrl+<键>\n");
+	help += QString::fromUtf8("双击右方向键也能切换该层（仅外接键盘）\n\n");
+	help += QString::fromUtf8("下滑菜单 -> 命令 / SSH：保存的常用命令与主机\n");
+	help += QString::fromUtf8("  点一行，然后 运行 / 仅插入 / 连接\n");
+	help += QString::fromUtf8("  连接自带 30 秒保活，掉线后顶部出现 重连 横条\n\n");
+	help += QString::fromUtf8("粘贴多行内容会先问一次：\n");
+	help += QString::fromUtf8("  原样粘贴（逐行执行）/ 合并成一行 / 取消\n");
+	help += QString::fromUtf8("设置里可改回滚缓冲行数（500 - 10000）\n\n");
+	help += QString::fromUtf8("触屏手势：\n");
+	help += QString::fromUtf8("  长按屏幕    选中该行并弹出 复制 / 粘贴 菜单\n");
+	help += QString::fromUtf8("  长按后拖动  扩展选区\n");
+	help += QString::fromUtf8("  两指上下滑  翻看历史输出\n");
+	help += QString::fromUtf8("  两指捏合/张开  缩小 / 放大字体（会记住）\n\n");
+	help += QString::fromUtf8("拼音输入法（Alt+Enter，左上角出现 中 标记）：\n");
+	help += QString::fromUtf8("  a-z     输入拼音（可整词：nihao -> 你好）\n");
+	help += QString::fromUtf8("  1-8     选候选字    Space  取高亮候选\n");
+	help += QString::fromUtf8("  = . >   下一页      - , <  上一页\n");
+	help += QString::fromUtf8("          （候选条有第二页时才有效）\n");
+	help += QString::fromUtf8("  点      候选条上的候选字 / < > 箭头\n");
+	help += QString::fromUtf8("  Enter   按英文字母直接上屏（不切换）\n");
+	help += QString::fromUtf8("  Esc     放弃组字（什么都不发送）\n");
+	help += QString::fromUtf8("  触控板（Q20/Q10/Q5/Classic）：左右选候选，\n");
+	help += QString::fromUtf8("           上下翻页，按下即上屏\n\n");
+	help += QString::fromUtf8("字体：%1   输入法：%2（字体随包，未安装到系统）\n\n")
+	         .arg(gTerminalFontFamily.isEmpty() ? QString::fromUtf8("Courier New（未找到中文字形）")
 	                                            : gTerminalFontFamily)
 	         .arg(_imeOn ? QString::fromUtf8("中文") : QString("EN"));
-	help += QString("last Shift keycode: native=0x%1 scan=0x%2 right=%3\n")
+	help += QString::fromUtf8("最后按下的 Shift：native=0x%1 scan=0x%2 右Shift=%3\n")
 	         .arg(_lastShiftNative, 0, 16)
 	         .arg(_lastShiftScan, 0, 16)
-	         .arg(_lastShiftWasRight ? QString("yes") : QString("no"));
+	         .arg(_lastShiftWasRight ? QString::fromUtf8("是") : QString::fromUtf8("否"));
 
-	QMessageBox::information(this, QString("Key bindings"), help,
-	                         QMessageBox::Ok);
+	// A plain message box would clip the bottom of this much text on the
+	// 720x720 screen, so the help gets its own scrollable window.
+	QDialog dlg(this);
+	dlg.setWindowTitle(QString::fromUtf8("按键说明"));
+	dlg.setStyleSheet(QString("QDialog { background-color: %1; }")
+	                      .arg(UiTheme::hex(UiTheme::Bg)));
+
+	QVBoxLayout *lay = new QVBoxLayout(&dlg);
+	lay->setContentsMargins(20, 16, 20, 18);
+	lay->setSpacing(14);
+
+	lay->addWidget(UiTheme::newHeader(&dlg, QString::fromUtf8("按键说明"),
+	                                  QString::fromUtf8("上下滑动查看全部")));
+
+	QPlainTextEdit *view = new QPlainTextEdit(&dlg);
+	view->setReadOnly(true);
+	view->setPlainText(help);
+	view->setLineWrapMode(QPlainTextEdit::NoWrap);
+	view->setFrameShape(QFrame::NoFrame);
+
+	QFont hf = UiTheme::monoFont(18);
+	view->setFont(hf);
+	lay->addWidget(view, 1);
+
+	QPushButton *btnClose = new QPushButton(QString::fromUtf8("关闭"), &dlg);
+	btnClose->setObjectName(QString("primary"));
+	btnClose->setMinimumHeight(72);
+	btnClose->setFocusPolicy(Qt::NoFocus);
+	lay->addWidget(btnClose);
+	connect(btnClose, SIGNAL(clicked()), &dlg, SLOT(accept()));
+
+	dlg.resize(qMin(width() - 40, 900), qMin(height() - 40, 1200));
+	dlg.exec();
 }
 
 void TerminalDisplay::handleMetaKey(QKeyEvent *event)
@@ -2798,6 +2910,254 @@ bool TerminalDisplay::imeTrackpadClick()
 	return true;
 }
 
+/* ------------------------------------------------------------------------- */
+/*                 Quick commands / saved SSH hosts                          */
+/* ------------------------------------------------------------------------- */
+
+void TerminalDisplay::sendToShell(const QByteArray &bytes)
+{
+	if (bytes.isEmpty())
+		return;
+	td_write_bytes(bytes.constData(), bytes.size());
+}
+
+void TerminalDisplay::toggleCommandPanel()
+{
+	if (!_cmdPanel) {
+		_cmdPanel = new CCommandPanel(this);
+		connect(_cmdPanel, SIGNAL(commandChosen(QString,bool)),
+		        this, SLOT(onQuickCommand(QString,bool)));
+		connect(_cmdPanel, SIGNAL(sshChosen(QString,QString,int,QString,QString)),
+		        this, SLOT(runSshConnection(QString,QString,int,QString,QString)));
+	}
+
+	if (_cmdPanel->isOpen())
+		_cmdPanel->dismiss();
+	else
+		_cmdPanel->popup();
+}
+
+void TerminalDisplay::onQuickCommand(const QString &command, bool run)
+{
+	if (_cmdPanel)
+		_cmdPanel->dismiss();
+
+	// A saved snippet may contain line breaks; the pty wants a carriage return
+	// for each of them, just like pressing Enter.
+	QString text = command;
+	text.replace("\r\n", "\n");
+	text.replace('\n', '\r');
+
+	QByteArray bytes = text.toUtf8();
+	if (run)
+		bytes.append('\r');
+	sendToShell(bytes);
+	setFocus();
+}
+
+void TerminalDisplay::runSshConnection(const QString &user, const QString &host,
+                                       int port, const QString &identity,
+                                       const QString &password)
+{
+	QString cmd = QString("ssh -o StrictHostKeyChecking=accept-new"
+	                      " -o ServerAliveInterval=30"   // keep the link alive
+	                      " -o ServerAliveCountMax=3"    // ~90 s before giving up
+	                      " -o TCPKeepAlive=yes");
+	if (port > 0 && port != 22)
+		cmd += QString(" -p %1").arg(port);
+	if (!identity.isEmpty()) {
+		QString key = identity;
+		if (key.contains(' '))
+			key = "'" + key + "'";
+		cmd += " -i " + key;
+	}
+	if (!user.isEmpty())
+		cmd += " " + user + "@" + host;
+	else
+		cmd += " " + host;
+
+	if (_cmdPanel)
+		_cmdPanel->dismiss();
+
+	sendToShell(cmd.toUtf8());
+	sendToShell(QByteArray(1, '\r'));
+
+	_sshTail.clear();
+
+	// Remembered so the dropped-connection banner can offer "重连" without
+	// the user retyping anything.
+	_lastSshCmd      = cmd;
+	_lastSshUser     = user;
+	_lastSshHost     = host;
+	_lastSshPort     = port;
+	_lastSshIdentity = identity;
+	_lastSshPassword = password;
+	_dcShown         = false;
+	_dcTail.clear();
+	hideDisconnectBanner();
+	if (!password.isEmpty()) {
+		_sshPendingPwd = password;
+		if (!_sshPwdTimer) {
+			_sshPwdTimer = new QTimer(this);
+			_sshPwdTimer->setSingleShot(true);
+			connect(_sshPwdTimer, SIGNAL(timeout()),
+			        this, SLOT(clearPendingSshPassword()));
+		}
+		_sshPwdTimer->start(30000);
+	} else {
+		_sshPendingPwd.clear();
+	}
+	setFocus();
+}
+
+void TerminalDisplay::clearPendingSshPassword()
+{
+	_sshPendingPwd.clear();
+	_sshTail.clear();
+	if (_sshPwdTimer)
+		_sshPwdTimer->stop();
+}
+
+// ---------------------------------------------------------------------------
+// Dropped-connection banner: a thin strip along the top that says the session
+// is gone and offers to run the very same ssh command again.
+// ---------------------------------------------------------------------------
+void TerminalDisplay::buildDisconnectBanner()
+{
+	if (_dcBanner)
+		return;
+
+	QFrame *frame = new QFrame(this);
+	frame->setObjectName(QString("dcBanner"));
+	// Translucent so the rounded corners really round (the terminal keeps
+	// painting underneath) instead of showing four grey square corners.
+	frame->setAttribute(Qt::WA_TranslucentBackground, true);
+	frame->setAutoFillBackground(false);
+	frame->setStyleSheet(QString(
+	    "QFrame#dcBanner { background-color: rgba(36, 28, 12, 240);"
+	    " border: 1px solid #6b5620; border-radius: 18px; }"
+	    "QLabel { color: #f2cc60; font-size: 21px; }"
+	    "QPushButton { background-color: #00e05a; color: #04140a;"
+	    "  border: none; border-radius: 12px; padding: 8px 20px;"
+	    "  font-size: 22px; font-weight: bold; }"
+	    "QPushButton:pressed { background-color: #00c24e; }"
+	    "QPushButton#dcClose { background-color: transparent;"
+	    "  color: #8d9aa7; font-size: 26px; padding: 0px; }"));
+
+	QHBoxLayout *lay = new QHBoxLayout(frame);
+	lay->setContentsMargins(18, 8, 12, 8);
+	lay->setSpacing(10);
+
+	_dcLabel = new QLabel(QString::fromUtf8("连接已断开"), frame);
+	QPushButton *btnReconnect = new QPushButton(QString::fromUtf8("重连"), frame);
+	btnReconnect->setFocusPolicy(Qt::NoFocus);
+	btnReconnect->setMinimumHeight(38);
+	QPushButton *btnClose = new QPushButton(QString::fromUtf8("×"), frame);
+	btnClose->setObjectName(QString("dcClose"));
+	btnClose->setFocusPolicy(Qt::NoFocus);
+	btnClose->setFixedSize(38, 38);
+
+	lay->addWidget(_dcLabel, 1);
+	lay->addWidget(btnReconnect, 0);
+	lay->addWidget(btnClose, 0);
+
+	connect(btnReconnect, SIGNAL(clicked()), this, SLOT(onDisconnectReconnect()));
+	connect(btnClose,     SIGNAL(clicked()), this, SLOT(onDisconnectDismiss()));
+
+	_dcBanner = frame;
+	_dcBanner->hide();
+}
+
+void TerminalDisplay::layoutDisconnectBanner()
+{
+	if (!_dcBanner)
+		return;
+
+	int w = rect().width() - 16;
+	if (w > 520) w = 520;
+	if (w < 240) w = 240;
+	_dcBanner->setGeometry((rect().width() - w) / 2, 10, w, 54);
+}
+
+void TerminalDisplay::showDisconnectBanner()
+{
+	buildDisconnectBanner();
+	layoutDisconnectBanner();
+	if (_dcLabel && !_lastSshHost.isEmpty())
+		_dcLabel->setText(QString::fromUtf8("连接已断开：%1").arg(_lastSshHost));
+	_dcBanner->show();
+	_dcBanner->raise();
+}
+
+void TerminalDisplay::hideDisconnectBanner()
+{
+	if (_dcBanner && _dcBanner->isVisible())
+		_dcBanner->hide();
+}
+
+void TerminalDisplay::onDisconnectReconnect()
+{
+	hideDisconnectBanner();
+	if (_lastSshCmd.isEmpty())
+		return;
+
+	// Same host, same key; a stored password is armed again for the new
+	// prompt by runSshConnection().
+	runSshConnection(_lastSshUser, _lastSshHost, _lastSshPort,
+	                 _lastSshIdentity, _lastSshPassword);
+}
+
+void TerminalDisplay::onDisconnectDismiss()
+{
+	hideDisconnectBanner();
+	setFocus();
+}
+
+// ssh asks for the password on the tty, not through a helper process, so the
+// answer has to come from whoever owns the pty: this widget. The prompt can
+// arrive split over two reads, hence the small tail buffer.
+void TerminalDisplay::onSessionOutput(const QString &text)
+{
+	// --- dropped connection --------------------------------------------
+	// ssh says one of these on its way out; catching it here saves the user
+	// from having to spot the line in the scrollback and retype the command.
+	// Only armed once an ssh session was started from this widget.
+	if (!_lastSshCmd.isEmpty() && !_dcShown) {
+		_dcTail += text;
+		if (_dcTail.size() > 256)
+			_dcTail = _dcTail.right(256);
+		const QString low = _dcTail.toLower();
+		const bool dropped =
+			low.contains(QString("connection closed")) ||
+			low.contains(QString("connection reset")) ||
+			low.contains(QString("broken pipe")) ||
+			low.contains(QString("disconnected from")) ||
+			(low.contains(QString("connection to ")) &&
+			 low.contains(QString(" closed")));
+		if (dropped) {
+			_dcShown = true;
+			_dcTail.clear();
+			showDisconnectBanner();
+		}
+	}
+
+	if (_sshPendingPwd.isEmpty())
+		return;
+
+	_sshTail += text.toLower();
+	if (_sshTail.size() > 64)
+		_sshTail = _sshTail.right(64);
+
+	if (!_sshTail.contains(QString("password")) &&
+	    !_sshTail.contains(QString::fromUtf8("\u5bc6\u7801")))
+		return;
+
+	QByteArray pwd = _sshPendingPwd.toUtf8();
+	pwd.append('\r');
+	td_write_bytes(pwd.constData(), pwd.size());
+	clearPendingSshPassword();
+}
+
 bool TerminalDisplay::handleImeKey(QKeyEvent* event)
 {
 	if (!_imeOn || !_ime)
@@ -2809,41 +3169,45 @@ bool TerminalDisplay::handleImeKey(QKeyEvent* event)
 		return false;
 
 	// The letters are kept aside as they were typed (the engine lowercases
-	// its own pinyin buffer), so Space can flush them as plain English with
+	// its own pinyin buffer), so Enter can flush them as plain English with
 	// the original case. Nothing is left to flush once the composition is
 	// gone, so a stale buffer can never leak into a later word.
 	if (cjk_ime_preedit(_ime)[0] == '\0')
 		_imeRaw.clear();
 
 	// While a composition runs the arrows steer the strip: left/right step the
-	// highlight, up/down turn the page, Enter commits the highlight. Without a
-	// composition they keep their normal job, so the shell still gets them.
+	// highlight, up/down turn the page. Without a composition they keep their
+	// normal job, so the shell still gets them.
 	if (_imePanel && _imePanel->isOpen() && cjk_ime_preedit(_ime)[0] != '\0') {
 		switch (event->key()) {
 		case Qt::Key_Left:  _imePanel->moveHighlight(-1); event->accept(); return true;
 		case Qt::Key_Right: _imePanel->moveHighlight(+1); event->accept(); return true;
 		case Qt::Key_Up:    onImePageRequested(-1);       event->accept(); return true;
 		case Qt::Key_Down:  onImePageRequested(+1);       event->accept(); return true;
-		case Qt::Key_Return:
-		case Qt::Key_Enter:
-			// Enter takes the highlighted candidate (candidate 1 when nothing
-			// was steered to), the way a desktop input method does; Esc drops it.
-			_imePanel->commitHighlighted();
-			_imeRaw.clear();
-			event->accept();
-			return true;
 		default: break;
 		}
 	}
 
-	// Space while composing sends what was typed as plain English plus a
-	// space instead of taking the first candidate: an English word then
-	// needs no 中/EN toggle, and Enter stays the key that commits Chinese.
+	// Space takes the highlighted candidate (candidate 1 when nothing was
+	// steered to), the way a desktop input method does.
 	if (event->key() == Qt::Key_Space && cjk_ime_preedit(_ime)[0] != '\0') {
+		if (_imePanel)
+			_imePanel->commitHighlighted();
+		_imeRaw.clear();
+		event->accept();
+		return true;
+	}
+
+	// Enter while composing sends what was typed as plain English, exactly as
+	// typed (case included) and with nothing appended: an English word then
+	// needs no 中/EN toggle, and a composition can never be turned into a
+	// Chinese character by accident. No newline is sent - the composition
+	// ends, so a second Enter (nothing composing now) runs the line.
+	if ((event->key() == Qt::Key_Return || event->key() == Qt::Key_Enter) &&
+	    cjk_ime_preedit(_ime)[0] != '\0') {
 		QByteArray raw = _imeRaw.isEmpty()
 		                 ? QByteArray(cjk_ime_preedit(_ime))
 		                 : _imeRaw.toUtf8();
-		raw.append(' ');
 		td_write_bytes(raw.constData(), raw.size());
 		cjk_ime_reset(_ime);
 		_imeRaw.clear();
@@ -2854,7 +3218,7 @@ bool TerminalDisplay::handleImeKey(QKeyEvent* event)
 
 	int sym = imeSymForEvent(event);
 
-	// Keep the letters as typed (case included) for the Space flush above;
+	// Keep the letters as typed (case included) for the Enter flush above;
 	// Backspace takes the last one back out so the flush always matches the
 	// candidate strip.
 	if ((sym >= 'a' && sym <= 'z') || (sym >= 'A' && sym <= 'Z')) {
@@ -2909,6 +3273,11 @@ bool TerminalDisplay::handleImeKey(QKeyEvent* event)
 void TerminalDisplay::keyPressEvent( QKeyEvent* event )
 {
 //qDebug("+++%s %d keyPressEvent and key is %d, modifiers=%x", __FILE__, __LINE__, event->key(), int(event->modifiers()));
+
+	// Typing anything means the user has moved on (usually by starting a new
+	// ssh by hand), so the "连接已断开" strip has done its job.
+	if (_dcBanner && _dcBanner->isVisible())
+		hideDisconnectBanner();
 
 	// Alt+Enter switches the pinyin input method (中 / EN).
 	if (event->modifiers() == Qt::AltModifier &&
@@ -3581,4 +3950,261 @@ void TerminalDisplay::keyReleaseEvent( QKeyEvent* event )
 			_ctrlHeld = false;
 	}
 	QWidget::keyReleaseEvent(event);
+}
+
+/* ------------------------------------------------------------------------- */
+/*                            Finger gestures                                */
+/* ------------------------------------------------------------------------- */
+
+// Kept apart from the mouse handlers on purpose: the platform still delivers
+// mouse events for a stylus or a paired mouse, and those paths must keep
+// working exactly as before.
+
+void TerminalDisplay::touchEvent(QTouchEvent *ev)
+{
+	if (!_screenWindow) {
+		ev->ignore();
+		return;
+	}
+
+	if (!_tsLongTimer) {
+		_tsLongTimer = new QTimer(this);
+		_tsLongTimer->setSingleShot(true);
+		connect(_tsLongTimer, SIGNAL(timeout()), this, SLOT(onTouchLongPress()));
+	}
+
+	const QList<QTouchEvent::TouchPoint> pts = ev->touchPoints();
+
+	// Only the points that are still down matter; a lifted finger shows up
+	// as TouchPointReleased and must not be counted for the pinch distance.
+	int n = 0;
+	QPointF p0, p1;
+	for (int i = 0; i < pts.size(); ++i) {
+		if (pts.at(i).state() == Qt::TouchPointReleased)
+			continue;
+		if (n == 0)      p0 = pts.at(i).pos();
+		else if (n == 1) p1 = pts.at(i).pos();
+		++n;
+	}
+
+	if (n >= 2) {
+		// Two fingers: pinch to change the font size, or a straight
+		// up/down drag to walk through the scrollback.
+		_tsLongTimer->stop();
+		_tsMode = 2;
+
+		qreal d = QLineF(p0, p1).length();
+		qreal y = (p0.y() + p1.y()) / 2.0;
+
+		if (_tsTwoMode == 0 && _tsPinchBase <= 0) {
+			_tsPinchBase = d;
+			_tsPinchPx = (mainWindow && mainWindow->nFontSize > 0)
+			             ? mainWindow->nFontSize : 22;
+			_tsPinchCur = _tsPinchPx;
+			_tsBaseY = y;
+			_tsLastY = y;
+			_tsScrollAcc = 0;
+			ev->accept();
+			return;
+		}
+
+		if (_tsTwoMode == 0) {
+			// Decide once, then stick to it, so a pinch never turns into
+			// a scroll halfway through.
+			if (_tsPinchBase > 1 && qAbs(d / _tsPinchBase - 1.0) > 0.08)
+				_tsTwoMode = 2;
+			else if (qAbs(y - _tsBaseY) > 24.0)
+				_tsTwoMode = 1;
+		}
+
+		if (_tsTwoMode == 2) {
+			if (_tsPinchBase > 1) {
+				int px = qRound(_tsPinchPx * (d / _tsPinchBase));
+				if (px < 10) px = 10;
+				if (px > 60) px = 60;
+				if (px != _tsPinchCur) {
+					_tsPinchCur = px;
+					applyFontPixelSize(px);
+				}
+			}
+		} else if (_tsTwoMode == 1) {
+			qreal step = (_fontHeight > 4) ? _fontHeight : 20;
+			_tsScrollAcc += (_tsLastY - y);      // finger up => scroll forward
+			int lines = (int)(_tsScrollAcc / step);
+			if (lines != 0) {
+				_tsScrollAcc -= lines * step;
+				_scrollBar->setValue(_scrollBar->value() + lines);
+			}
+		}
+
+		_tsLastY = y;
+		ev->accept();
+		return;
+	}
+
+	if (n == 1) {
+		if (ev->type() == QEvent::TouchBegin) {
+			_tsMode = 1;
+			_tsMoved = false;
+			_tsLongFired = false;
+			_tsTwoMode = 0;
+			_tsPinchBase = 0;
+			_tsStart = p0.toPoint();
+			_tsLongTimer->start(450);
+			ev->accept();
+			return;
+		}
+
+		if (ev->type() == QEvent::TouchUpdate) {
+			QPoint now = p0.toPoint();
+			if (!_tsMoved && (now - _tsStart).manhattanLength() > 16) {
+				_tsMoved = true;
+				_tsLongTimer->stop();
+			}
+			// Dragging after the long press grows the selection instead of
+			// scrolling, which is the usual "select some text" gesture.
+			if (_tsLongFired && _tsMoved)
+				extendTouchSelection(now);
+			ev->accept();
+			return;
+		}
+
+		ev->accept();
+		return;
+	}
+
+	// Everything lifted.
+	if (ev->type() == QEvent::TouchEnd) {
+		_tsLongTimer->stop();
+		if (_tsMode == 1 && !_tsMoved && !_tsLongFired)
+			setFocus();          // a plain tap just brings the keyboard focus back
+
+		// The menu opens when the finger goes up, not while it is still
+		// down: a menu popped under a pressed finger would take that
+		// release as a click on its first entry.
+		if (_tsMode == 1 && _tsLongFired) {
+			QPoint at = _tsStart;
+			_tsMoved = false;
+			_tsLongFired = false;
+			showTouchMenu(at);
+		}
+
+		_tsMode = 0;
+		_tsTwoMode = 0;
+		_tsPinchBase = 0;
+	}
+
+	ev->ignore();
+}
+
+void TerminalDisplay::onTouchLongPress()
+{
+	if (!_screenWindow || _tsMoved)
+		return;
+
+	int absLine = -1;
+	selectLineAt(_tsStart, &absLine);
+	if (absLine < 0)
+		return;
+
+	_tsLongFired = true;
+	update();
+}
+
+void TerminalDisplay::selectLineAt(const QPoint& pos, int* absLine)
+{
+	*absLine = -1;
+	if (!_screenWindow)
+		return;
+
+	int line = 0, column = 0;
+	getCharacterPosition(pos, line, column);
+	if (line < 0 || line >= _lines)
+		return;
+
+	int abs = line + _scrollBar->value();
+	_screenWindow->setSelectionStart(0, abs, false);
+	_screenWindow->setSelectionEnd(_columns - 1, abs);
+	*absLine = abs;
+}
+
+void TerminalDisplay::extendTouchSelection(const QPoint& pos)
+{
+	if (!_screenWindow)
+		return;
+
+	int line = 0, column = 0;
+	getCharacterPosition(pos, line, column);
+	if (line < 0) line = 0;
+	if (line >= _lines) line = _lines - 1;
+	if (column < 0) column = 0;
+	if (column >= _columns) column = _columns - 1;
+
+	_screenWindow->setSelectionEnd(column, line + _scrollBar->value());
+	update();
+}
+
+void TerminalDisplay::showTouchMenu(const QPoint& pos)
+{
+	QMenu menu(this);
+	QAction *aCopyLine = menu.addAction(QString::fromUtf8("复制本行"));
+	QAction *aCopyText = menu.addAction(QString::fromUtf8("复制选中文字"));
+	QAction *aCopyScreen = menu.addAction(QString::fromUtf8("复制可见屏幕"));
+	menu.addSeparator();
+	QAction *aPaste = menu.addAction(QString::fromUtf8("粘贴"));
+
+	QAction *chosen = menu.exec(mapToGlobal(pos));
+
+	if (chosen == aCopyLine) {
+		int abs = -1;
+		selectLineAt(_tsStart, &abs);   // re-select: a drag may have widened it
+		if (abs >= 0)
+			copySelectionToClipboard();
+		return;
+	}
+	if (chosen == aCopyText  ) { copySelectionToClipboard(); return; }
+	if (chosen == aCopyScreen) {
+		int top = _scrollBar->value();
+		int bottom = top + _lines - 1;
+		int maxBottom = _scrollBar->maximum() + _lines - 1;
+		if (bottom > maxBottom) bottom = maxBottom;
+		_screenWindow->setSelectionStart(0, top, false);
+		_screenWindow->setSelectionEnd(_columns - 1, bottom);
+		copySelectionToClipboard();
+		return;
+	}
+
+	// Cancelled, or paste: either way the highlight goes away.
+	if (_screenWindow)
+		_screenWindow->clearSelection();
+	update();
+
+	if (chosen == aPaste)
+		pasteClipboard();
+}
+
+void TerminalDisplay::copySelectionToClipboard()
+{
+	if (!_screenWindow)
+		return;
+
+	QString text = _screenWindow->selectedText(true);
+
+	// The screen is padded with blanks; pasting those would look like
+	// trailing garbage in an editor.
+	QStringList out;
+	QStringList lines = text.split(QLatin1Char('\n'));
+	for (int i = 0; i < lines.size(); ++i) {
+		QString l = lines.at(i);
+		while (l.endsWith(QLatin1Char(' ')) || l.endsWith(QLatin1Char('\t')))
+			l.chop(1);
+		out << l;
+	}
+	while (!out.isEmpty() && out.last().isEmpty())
+		out.removeLast();
+
+	QApplication::clipboard()->setText(out.join(QString(QLatin1String("\n"))));
+
+	_screenWindow->clearSelection();
+	update();
 }

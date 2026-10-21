@@ -6,7 +6,6 @@
 #include <QtGui/QWidget>
 #include <QtGui/QToolButton>
 #include "mysettingswindow.h"
-#include "mydonatewindow.h"
 
 class CMySystemMenu : public QWidget
 {
@@ -19,13 +18,16 @@ public:
     virtual ~CMySystemMenu(){};
 
     QToolButton *btnSettings;
-    QToolButton *btnDonate;
+    QToolButton *btnCmds;
     CMySettingsWindow *wdgSettingsWindow;
-    CMyDonateWindow *wdgDonateWindow;
+
+protected:
+    // The menu is a floating card, not a grey strip: draw it by hand.
+    void paintEvent(QPaintEvent *event);
 
 private slots:
 	void on_btnSettings_clicked();
-	void on_btnDonate_clicked();
+	void on_btnCmds_clicked();
 };
 
 #endif
