@@ -26,7 +26,16 @@
 
 // Own
 #include "TerminalDisplay.h"
+
+// Hold timings for the copy/paste gesture. The line lights up first, so the
+// finger gets an answer straight away; the menu then opens by itself instead
+// of waiting for the finger to lift, because nobody can guess how long "long"
+// is supposed to be. 700 + 600 ms in total - three seconds feels broken on a
+// terminal where every other tap answers at once.
+static const int kHoldLineMs = 700;
+static const int kHoldMenuMs = 600;
 #include "cmdpanel.h"
+#include "cshell.h"      // CShellSession::send() - per-tab input path
 
 // Qt
 #include <QtGui/QApplication>
@@ -35,10 +44,38 @@
 #include <QtGui/QKeyEvent>
 #include <QtCore/QEvent>
 #include <QtCore/QTime>
+#include <QtCore/QVector>
+#include <QtCore/QFile>
+#include <QtCore/QDir>
+#include <QtCore/QTextStream>
 #include <QtCore/QDateTime>
 #include <QtCore/QSettings>
 #include <QtGui/QMessageBox>
 #include <QtCore/QFile>
+#include <QtCore/QDir>
+#include <QtCore/QFileInfo>
+
+// Rendering diagnostic: updateImage() ran but no paint followed. If a frozen
+// screen is ever reported again, data/render.log shows whether the output
+// reached the widget at all. Capped, so a long session cannot fill the disk.
+static void rlog(const char* what, int a = 0, int b = 0)
+{
+  static int n = 0;
+  if (n > 200)
+    return;
+  ++n;
+  QFile f(QDir::current().absoluteFilePath(QString::fromLatin1("data/render.log")));
+  if (!f.open(QIODevice::WriteOnly | QIODevice::Append))
+    return;
+  QTextStream ts(&f);
+  ts << QTime::currentTime().toString("HH:mm:ss.zzz") << ' '
+     << QString::fromLatin1(what) << " a=" << a << " b=" << b << '\n';
+}
+
+// From main.cpp: "OpenSSH_x.y" of the client that PATH resolves to, or
+// 0.0 when the probe failed (keeps us on the conservative option set).
+extern int gSshMajor;
+extern int gSshMinor;
 #include <QtGui/QGridLayout>
 #include <QtGui/QPlainTextEdit>
 #include <QtGui/QPushButton>
@@ -65,15 +102,17 @@
 #include "Filter.h"
 #include "konsole_wcwidth.h"
 #include "ScreenWindow.h"
+#include "Screen.h"          // isAlternateScreen() for the scroll fallback
 #include "TerminalCharacterDecoder.h"
 #include "ColorTables.h"
 
 #include "mymainwindow.h"
 #include "symbolpanel.h"
 #include "imepanel.h"
+#include "keybar.h"
 #include "mydevicetype.h"
 #include "uitheme.h"
-extern int masterFdG;
+extern int gActiveFd;
 extern bool bCtrlFlag;
 extern bool bShiftFlag;
 extern CMyMainWindow *mainWindow;
@@ -194,8 +233,15 @@ unsigned short Konsole::vt100_graphics[32] =
 void TerminalDisplay::fontChange(const QFont&)
 {
   QFontMetrics fm(font());
-  //_fontHeight = fm.height() + _lineSpacing;
-  _fontHeight = mainWindow->nFontSize + _lineSpacing + 2;
+  // The row has to be at least as tall as ascent+descent.  QPainter draws a
+  // cell with drawText(rect, ...), which clips to that rectangle, and a
+  // glyph that reaches below the baseline ('_' is almost entirely there)
+  // is silently cut off when the row is only nFontSize tall.
+  {
+    const int want = mainWindow->nFontSize + _lineSpacing + 2;
+    const int need = fm.ascent() + fm.descent() + _lineSpacing;
+    _fontHeight = qMax(want, need);
+  }
 
   // waba TerminalDisplay 1.123:
   // "Base character width on widest ASCII character. This prevents too wide
@@ -274,6 +320,8 @@ TerminalDisplay::TerminalDisplay(QWidget *parent)
 ,_contentHeight(1)
 ,_contentWidth(1)
 ,_image(0)
+,_snapshot(0)
+,_snapshotValid(false)
 ,_randomSeed(0)
 ,_resizing(false)
 ,_terminalSizeHint(false)
@@ -290,6 +338,15 @@ TerminalDisplay::TerminalDisplay(QWidget *parent)
 ,_blinking(false)
 ,_cursorBlinking(false)
 ,_hasBlinkingCursor(false)
+,_needsFullRepaint(false)
+,_imgUpdates(0)
+,_paintedUpdate(0)
+,_refreshTimer(0)
+,_watchdogTries(0)
+,_inPaint(false)
+,_forceCount(0)
+,_lastIdleProbeMs(0)
+,_lastTickMs(0)
 ,_ctrlDrag(false)
 ,_tripleClickMode(SelectWholeLine)
 ,_isFixedSize(false)
@@ -304,8 +361,6 @@ TerminalDisplay::TerminalDisplay(QWidget *parent)
 ,_filterChain(new TerminalImageFilterChain())
 ,_cursorShape(BlockCursor)
 ,_metaArmed(false)
-,_metaLastRightMs(0)
-,_metaLastShiftMs(0)
 ,_ctrlHeld(false)
 ,_lastShiftNative(0)
 ,_lastShiftScan(0)
@@ -313,13 +368,20 @@ TerminalDisplay::TerminalDisplay(QWidget *parent)
 ,_metaBadge(0)
 ,_symPanel(0)
 ,_imeOn(false)
+,_imeCommitMs(0)
 ,_ime(0)
 ,_imePanel(0)
+,_bottomReserve(0)
+,_suppressSizeHint(false)
 ,_imeBadge(0)
+,_keyBar(0)
+,_keyBarOn(false)
 ,_cmdPanel(0)
 ,_sshPwdTimer(0)
+,_sshPwdTries(0)
 ,_lastSshPort(22)
 ,_dcShown(false)
+,_sshDiagShown(false)
 ,_dcBanner(0)
 ,_dcLabel(0)
 ,_tsLongTimer(0)
@@ -333,6 +395,13 @@ TerminalDisplay::TerminalDisplay(QWidget *parent)
 ,_tsBaseY(0)
 ,_tsLastY(0)
 ,_tsScrollAcc(0)
+,_tsTouching(false)
+,_tsScrolling(false)
+,_tsDragLastY(0)
+,_tsLastTapMs(0)
+,_tsLongStage(0)
+,_tsMenuShown(false)
+,_inputSession(0)
 {
   // terminal applications are not designed with Right-To-Left in mind,
   // so the layout is forced to Left-To-Right
@@ -358,9 +427,18 @@ TerminalDisplay::TerminalDisplay(QWidget *parent)
   _blinkCursorTimer   = new QTimer(this);
   connect(_blinkCursorTimer, SIGNAL(timeout()), this, SLOT(blinkCursorEvent()));
 
+  // Watchdog for the case where output reached the character grid but never
+  // reached the screen. It does nothing while the two counters agree, so an
+  // idle terminal pays one timer tick every 400 ms and nothing else, and a
+  // stalled one heals within half a second instead of waiting for a touch.
+  _refreshTimer = new QTimer(this);
+  _refreshTimer->setInterval(400);
+  connect(_refreshTimer, SIGNAL(timeout()), this, SLOT(refreshWatchdog()));
+  _refreshTimer->start();
+
 //  QCursor::setAutoHideCursor( this, true );
   
-  setUsesMouse(true);
+  setUsesMouse(false);
   // Take finger input ourselves: a tap focuses, a long press selects the line
   // and offers copy/paste, two fingers pinch-zoom or scroll the scrollback.
   setAttribute(Qt::WA_AcceptTouchEvents, true);
@@ -389,11 +467,16 @@ TerminalDisplay::TerminalDisplay(QWidget *parent)
   //set up a warning message when the user presses Ctrl+S to avoid confusion
   connect( this,SIGNAL(flowControlKeyPressed(bool)),this,SLOT(outputSuspended(bool)) );
 
-  // bring back the input method state of the previous run
   {
     QSettings settings;
-    if (settings.value(QString("ImeOn"), false).toBool())
-      setImeMode(true);
+    // Reading KeyBarOn is all this constructor may do.  It used to write
+    // "ImeOn=false" here on every construction - i.e. once per tab - and a
+    // QSettings write is a file write: opening five tabs meant five disk hits
+    // before a single character appeared, and the key was never read back
+    // anyway (nothing in the app reads ImeOn).  The IME now starts off simply
+    // because _imeOn is initialised to false.
+    if (settings.value(QString("KeyBarOn"), false).toBool())
+      setKeyBarEnabled(true);
   }
 
 }
@@ -403,6 +486,7 @@ TerminalDisplay::~TerminalDisplay()
   qApp->removeEventFilter( this );
   
   delete[] _image;
+  delete[] _snapshot;
 
   delete _gridLayout;
   delete _outputSuspendedLabel;
@@ -839,10 +923,18 @@ void TerminalDisplay::scrollImage(int lines , const QRect& screenWindowRegion)
 
         //scroll internal image down
         memmove( firstCharPos , lastCharPos , bytesToMove ); 
+
+        // Keep the paint reference in step with the data, otherwise the row
+        // comparison in paintEvent() would report every scrolled row as
+        // changed and repaint the whole screen on each scroll step.
+        if (_snapshot)
+            memmove( _snapshot + region.top() * this->_columns ,
+                     _snapshot + (region.top() + abs(lines)) * this->_columns ,
+                     bytesToMove );
       
         //set region of display to scroll, making sure that
         //the region aligns correctly to the character grid 
-        scrollRect = QRect( _leftMargin , top, 
+        scrollRect = QRect( textOriginX() , top, 
                             this->_usedColumns * _fontWidth , 
                             linesToMove * _fontHeight );
     }
@@ -854,10 +946,15 @@ void TerminalDisplay::scrollImage(int lines , const QRect& screenWindowRegion)
 
         //scroll internal image up
         memmove( lastCharPos , firstCharPos , bytesToMove ); 
+
+        if (_snapshot)
+            memmove( _snapshot + (region.top() + abs(lines)) * this->_columns ,
+                     _snapshot + region.top() * this->_columns ,
+                     bytesToMove );
      
         //set region of the display to scroll, making sure that
         //the region aligns correctly to the character grid
-        QPoint topPoint( _leftMargin , top + abs(lines)*_fontHeight );
+        QPoint topPoint( textOriginX() , top + abs(lines)*_fontHeight );
 
         scrollRect = QRect( topPoint ,
                      QSize( this->_usedColumns*_fontWidth , 
@@ -912,6 +1009,16 @@ void TerminalDisplay::updateImage()
   if ( !_screenWindow )
       return;
 
+  // A hidden tab still receives output, and the character grid has to keep
+  // up with it.  An older version skipped the whole update here and only
+  // remembered "stale": the rows were then copied whenever something else
+  // forced a repaint - so a widget the platform briefly reported as not
+  // visible (or a tab that came back) showed an old frame until the user
+  // touched or scrolled it.  That looked like a frozen terminal in full
+  // full screen apps such as claude.  Comparing characters is cheap; the
+  // paint is what costs, and update() is already a no-op for a widget that is
+  // really hidden, so the repaint request below is not conditional.
+
   // optimization - scroll the existing image where possible and 
   // avoid expensive text drawing for parts of the image that 
   // can simply be moved up or down
@@ -933,9 +1040,13 @@ void TerminalDisplay::updateImage()
 
   int y,x,len;
 
+  // Rows holding blinking text: blinkEvent() repaints only these, instead of
+  // the whole widget twice a second.
+  _blinkLines.clear();
+
   QPoint tL  = contentsRect().topLeft();
 
-  int    tLx = tL.x();
+  int    tLx = textOriginX();
   int    tLy = tL.y();
   _hasBlinker = false;
 
@@ -961,6 +1072,24 @@ void TerminalDisplay::updateImage()
     const Character* const newLine = &newimg[y*columns];
 
     bool updateLine = false;
+
+    // Remember the rows that blink so the blink timer can stay cheap.
+    {
+      bool lineBlinks = false;
+      for (x = 0; x < columnsToUpdate; ++x)
+      {
+        if (newLine[x].rendition & RE_BLINK)
+        {
+          lineBlinks = true;
+          break;
+        }
+      }
+      if (lineBlinks)
+      {
+        _hasBlinker = true;
+        _blinkLines.append(y);
+      }
+    }
     
     // The dirty mask indicates which characters need repainting. We also
     // mark surrounding neighbours dirty, in case the character exceeds
@@ -1047,7 +1176,7 @@ void TerminalDisplay::updateImage()
 
         // add the area occupied by this line to the region which needs to be
         // repainted
-        QRect dirtyRect = QRect( _leftMargin+tLx , 
+        QRect dirtyRect = QRect( tLx , 
                                  _topMargin+tLy+_fontHeight*y , 
                                  _fontWidth * columnsToUpdate , 
                                  _fontHeight ); 	
@@ -1064,7 +1193,7 @@ void TerminalDisplay::updateImage()
   // outside the new _image is cleared 
   if ( linesToUpdate < _usedLines )
   {
-    dirtyRegion |= QRect(   _leftMargin+tLx , 
+    dirtyRegion |= QRect(   tLx , 
                             _topMargin+tLy+_fontHeight*linesToUpdate , 
                             _fontWidth * this->_columns , 
                             _fontHeight * (_usedLines-linesToUpdate) );
@@ -1073,7 +1202,7 @@ void TerminalDisplay::updateImage()
   
   if ( columnsToUpdate < _usedColumns )
   {
-    dirtyRegion |= QRect(   _leftMargin+tLx+columnsToUpdate*_fontWidth , 
+    dirtyRegion |= QRect(   tLx+columnsToUpdate*_fontWidth , 
                             _topMargin+tLy , 
                             _fontWidth * (_usedColumns-columnsToUpdate) , 
                             _fontHeight * this->_lines );
@@ -1082,8 +1211,24 @@ void TerminalDisplay::updateImage()
 
   dirtyRegion |= _inputMethodData.previousPreeditRect;
 
-  // update the parts of the display which have changed
+  // update the parts of the display which have changed. The request goes out
+  // unconditionally, exactly as upstream Konsole does: update() does nothing
+  // for a widget that is genuinely hidden, and making it conditional on
+  // isVisible() is what left the screen frozen until the next touch.
+  if (!isVisible())
+    _needsFullRepaint = true;   // showEvent() repaints everything on return
   update(dirtyRegion);
+
+  // Diagnostic only: 15 frames of dirty output with no paint in between means
+  // the platform swallowed the repaint request.  The counter feeds the
+  // watchdog timer, so it must only move when there really was something to
+  // draw - a frame that changes nothing would otherwise look like a stall.
+  if (dirtyLineCount > 0)
+  {
+    ++_imgUpdates;
+    if ((_imgUpdates - _paintedUpdate) > 15)
+      rlog("no-paint", _imgUpdates, _paintedUpdate);
+  }
 
   if ( _hasBlinker && !_blinkTimer->isActive()) _blinkTimer->start( BLINK_DELAY ); 
   if (!_hasBlinker && _blinkTimer->isActive()) { _blinkTimer->stop(); _blinking = false; }
@@ -1094,6 +1239,11 @@ void TerminalDisplay::updateImage()
 
 void TerminalDisplay::showResizeNotification()
 {
+  // Reserving room for the IME strip is our own doing, not a user resize:
+  // flashing the "Size: 80 x 22" box on every 中文/EN switch is just noise.
+  if (_suppressSizeHint)
+     return;
+
   if (_terminalSizeHint && isVisible())
   {
      if (_terminalSizeStartup) {
@@ -1143,20 +1293,120 @@ void TerminalDisplay::setBlinkingCursor(bool blink)
 
 void TerminalDisplay::paintEvent( QPaintEvent* pe )
 {
-//qDebug("%s %d paintEvent", __FILE__, __LINE__);
+  _paintedUpdate = _imgUpdates;
+  _watchdogTries = 0;
+  _inPaint = true;
+  QTime paintClock;
+  paintClock.start();
   QPainter paint(this);
 
-  foreach (QRect rect, (pe->region() & contentsRect()).rects())
+  if (!_image || !_snapshot || _usedColumns <= 0 || _usedLines <= 0)
   {
-    drawBackground(paint,rect,palette().background().color(),	true /* use opacity setting */);
-    drawContents(paint, rect);    
+      paint.end();
+      _inPaint = false;
+      return;
   }
+
+  const QRect cr = contentsRect();
+  const QRect req = pe->region().boundingRect() & cr;
+  const QRect textArea = textAreaRect();
+
+  // What gets repainted is decided here, from the data, not from a remembered
+  // "dirty" flag.  Every row is compared against the copy that produced the
+  // pixels currently on screen: equal means those pixels are still correct,
+  // different means the row is rebuilt *whole*, from column 0 to the last
+  // column.  A row can never be missed and a row can never be half painted,
+  // which are the two ways a ghost gets on screen.
+  //
+  // The whole widget is redrawn only when the pixels themselves cannot be
+  // trusted: first paint, a resize, or a region covering most of the widget -
+  // which is how an expose (after being covered or minimised) arrives.
+  const qint64 crArea = qint64(cr.width()) * qint64(cr.height());
+  const qint64 reqArea = qint64(req.width()) * qint64(req.height());
+  const bool full = !_snapshotValid || reqArea * 2 > crArea;
+
+  QVector<bool> dirty(_usedLines, false);
+  int dirtyRows = 0;
+
+  if (!full)
+  {
+      for (int y = 0; y < _usedLines; y++)
+      {
+          if (memcmp(&_image[y*_columns], &_snapshot[y*_columns],
+                     _usedColumns * sizeof(Character)) != 0)
+          {
+              dirty[y] = true;
+              ++dirtyRows;
+          }
+      }
+
+      // Rows under the requested rectangle are repainted too: that area may
+      // have just been uncovered, so its pixels are gone even though the
+      // characters did not change.
+      if (req.isValid() && !req.isEmpty() && req.bottom() >= textArea.top())
+      {
+          const int y0 = qBound(0, (req.top()    - textArea.top()) / _fontHeight, _usedLines-1);
+          const int y1 = qBound(0, (req.bottom() - textArea.top()) / _fontHeight, _usedLines-1);
+          for (int y = y0; y <= y1; y++)
+          {
+              if (!dirty[y]) { dirty[y] = true; ++dirtyRows; }
+          }
+      }
+
+      if (dirtyRows == 0)
+      {
+          paint.end();
+          _inPaint = false;
+          return;
+      }
+  }
+
+  if (full)
+  {
+      drawBackground(paint, cr, palette().background().color(),
+                     true /* use opacity setting */);
+      for (int y = 0; y < _usedLines; y++)
+          drawContents(paint, rowRect(y));
+      dirtyRows = _usedLines;
+  }
+  else
+  {
+      for (int y = 0; y < _usedLines; y++)
+      {
+          if (!dirty[y])
+              continue;
+          const QRect rr = rowRect(y);
+          drawBackground(paint, rr, palette().background().color(),
+                         true /* use opacity setting */);
+          drawContents(paint, rr);
+      }
+
+      // Margins and the empty band below the last row belong to no row, so a
+      // request touching them is cleared on its own.
+      const QRegion outside = (pe->region() & cr) - QRegion(textArea);
+      foreach (QRect r, outside.rects())
+          drawBackground(paint, r, palette().background().color(), true);
+  }
+
+  // The pixels now agree with the grid; that grid is the reference for the
+  // next comparison.
+  memcpy(_snapshot, _image, _usedLines * _columns * sizeof(Character));
+  _snapshotValid = true;
 //    drawBackground(paint,contentsRect(),palette().background().color(),	true /* use opacity setting */);
 //    drawContents(paint, contentsRect());    
   drawInputMethodPreeditString(paint,preeditRect());
   paintFilters(paint);
 
   paint.end();
+  _inPaint = false;
+
+  // Real cost of one full frame on this device, so the watchdog interval can
+  // be chosen from measurements instead of guesses.
+  const int paintMs = paintClock.elapsed();
+  if (paintMs > 15)
+      rlog("paint-ms", paintMs, 0);
+  if (dirtyRows < _usedLines)
+      rlog("rows", dirtyRows, paintMs);
 }
 
 QPoint TerminalDisplay::cursorPosition() const
@@ -1174,8 +1424,8 @@ QRect TerminalDisplay::preeditRect() const
     if ( preeditLength == 0 )
         return QRect();
 
-    return QRect(_leftMargin + _fontWidth*cursorPosition().x(),
-                 _topMargin + _fontHeight*cursorPosition().y(),
+    return QRect(textOriginX() + _fontWidth*cursorPosition().x(),
+                 contentsRect().top() + _topMargin + _fontHeight*cursorPosition().y(),
                  _fontWidth*preeditLength,
                  _fontHeight);
 }   
@@ -1289,18 +1539,29 @@ void TerminalDisplay::drawContents(QPainter &paint, const QRect &rect)
 {
 //qDebug("%s %d drawContents and rect x=%d y=%d w=%d h=%d", __FILE__, __LINE__, rect.x(), rect.y(),rect.width(),rect.height());
 
-  QPoint tL  = contentsRect().topLeft();
-//  int    tLx = tL.x();
-  int    tLy = tL.y();
+  const QPoint tL  = contentsRect().topLeft();
+  const int    tLy = tL.y();
 
-  int tLx = (_contentWidth - _usedColumns * _fontWidth)/2;
-//  int tLy = (_contentHeight - _usedLines * _fontHeight)/2; 
-//qDebug("%d %d %d %d", tLx, tLy, _contentWidth, _usedColumns * _fontWidth);  
+  // Same origin as updateImage(): drawContents() centres the text block, and
+  // a dirty rect computed without that offset leaves a strip of the previous
+  // frame along the right edge of every line.
+  const int tLx = textOriginX();
+  const int contentTop = tLy + _topMargin;
 
-  int lux = qMin(_usedColumns-1, qMax(0,(rect.left()   - tLx - _leftMargin ) / _fontWidth));
-  int luy = qMin(_usedLines-1,  qMax(0, (rect.top()    - tLy - _topMargin  ) / _fontHeight));
-  int rlx = qMin(_usedColumns-1, qMax(0, (rect.right()  - tLx - _leftMargin ) / _fontWidth));
-  int rly = qMin(_usedLines-1,  qMax(0, (rect.bottom() - tLy - _topMargin  ) / _fontHeight));
+  if (_usedColumns <= 0 || _usedLines <= 0 || !_image)
+      return;
+
+  // Clip the damaged rect to the grid.  Clamping a rect that lies outside the
+  // grid onto the last row (the old qMin/qMax pair did exactly that) painted
+  // row N-1 into the empty area below the text - the duplicated lines users
+  // reported as "overlapping text".  If the rect misses the grid, draw nothing.
+  int lux = qMax(0, (rect.left()   - tLx       ) / _fontWidth);
+  int luy = qMax(0, (rect.top()    - contentTop) / _fontHeight);
+  int rlx = qMin(_usedColumns-1, (rect.right()  - tLx       ) / _fontWidth);
+  int rly = qMin(_usedLines-1,   (rect.bottom() - contentTop) / _fontHeight);
+
+  if (rlx < lux || rly < luy)
+      return;
 
   const int bufferSize = _usedColumns;
   QChar *disstrU = new QChar[bufferSize];
@@ -1324,7 +1585,8 @@ void TerminalDisplay::drawContents(QPainter &paint, const QRect &rect)
                             .lookupExtendedChar(_image[loc(x,y)].charSequence,extendedCharLength);
         for ( int index = 0 ; index < extendedCharLength ; index++ ) 
         {
-            Q_ASSERT( p < bufferSize );
+            if ( p >= bufferSize )   // release builds have no Q_ASSERT: bound it for real
+                break;
             disstrU[p++] = chars[index];
         }
       }
@@ -1334,8 +1596,8 @@ void TerminalDisplay::drawContents(QPainter &paint, const QRect &rect)
         c = _image[loc(x,y)].character;
         if (c)
         {
-             Q_ASSERT( p < bufferSize );
-             disstrU[p++] = c; //fontMap(c);
+             if ( p < bufferSize )
+                 disstrU[p++] = c; //fontMap(c);
         }
       }
 
@@ -1352,7 +1614,7 @@ void TerminalDisplay::drawContents(QPainter &paint, const QRect &rect)
              (_image[ qMin(loc(x+len,y)+1,_imageSize) ].character == 0) == doubleWidth &&
              isLineChar( c = _image[loc(x+len,y)].character) == lineDraw) // Assignment!
       {
-        if (c)
+        if (c && p < bufferSize)
           disstrU[p++] = c; //fontMap(c);
         if (doubleWidth) // assert((_image[loc(x+len,y)+1].character == 0)), see above if condition
           len++; // Skip trailing part of multi-column character
@@ -1380,7 +1642,7 @@ void TerminalDisplay::drawContents(QPainter &paint, const QRect &rect)
 		 }
 
 		 //calculate the area in which the text will be drawn
-		 QRect textArea = QRect( _leftMargin+tLx+_fontWidth*x , 
+		 QRect textArea = QRect( tLx+_fontWidth*x , 
 					_topMargin+tLy+_fontHeight*y , 
 					_fontWidth*len, 
 					_fontHeight);
@@ -1430,18 +1692,148 @@ void TerminalDisplay::blinkEvent()
 {
   _blinking = !_blinking;
 
-  //TODO:  Optimise to only repaint the areas of the widget 
-  // where there is blinking text
-  // rather than repainting the whole widget.
-  update();
+  // Deliberately no isVisible() gate: update() is already a no-op for a
+  // widget that is genuinely hidden, and bailing out here is the same trap
+  // that froze updateImage() - when the platform reports a visible widget as
+  // hidden, the blink stops and the cursor sits frozen mid-cycle.
+
+  if (_blinkLines.isEmpty() || !_image)
+  {
+      update();
+      return;
+  }
+
+  QRegion region;
+  const QRect cr = contentsRect();
+  for (int i = 0; i < _blinkLines.size(); ++i)
+  {
+      const int y = _blinkLines.at(i);
+      if (y < 0 || y >= _lines)
+          continue;
+      // Full width of the widget, not just the used columns: the text is
+      // centred, so a narrow rect would leave the edges of the old frame.
+      region |= QRect(cr.left(),
+                      _topMargin + cr.top() + _fontHeight * y,
+                      cr.width(),
+                      _fontHeight);
+  }
+  update(region.isEmpty() ? QRegion(cr) : region);
 }
 
-QRect TerminalDisplay::imageToWidget(const QRect& imageArea) const
+// Runs every 400 ms and only does something when output reached the grid but
+// the screen never followed. Two plain update() attempts first, then a
+// synchronous repaint(): update() goes through the event queue and a queued
+// request is exactly what a platform can drop, while repaint() paints now.
+void TerminalDisplay::refreshWatchdog()
 {
+  const qint64 now = QDateTime::currentMSecsSinceEpoch();
+  if (_lastTickMs > 0 && (now - _lastTickMs) > 1200)
+    rlog("ui-stall", (int)(now - _lastTickMs), 0);  // the UI thread itself was blocked
+  _lastTickMs = now;
+
+  if (!_screenWindow || !_image || _usedColumns <= 0 || _usedLines <= 0)
+    return;
+
+  // Output reached the grid but the screen never followed: push it out.
+  if (_imgUpdates > _paintedUpdate)
+  {
+      if (_watchdogTries >= 2)
+      {
+          rlog("force", _imgUpdates, _paintedUpdate);
+          _watchdogTries = 0;
+          forceRepaintNow();
+          return;
+      }
+      rlog("watchdog-update", _imgUpdates, _paintedUpdate);
+      ++_watchdogTries;
+      update(contentsRect());
+      return;
+  }
+
+  _watchdogTries = 0;
+
+  // Idle: nothing is known to be dirty, so this is not about catching up - it
+  // is a liveness probe for the paint channel itself.  A full repaint on every
+  // tick would be visible while scrolling, so the probe runs once every 2 s:
+  // cheap enough to leave on permanently, frequent enough to catch a dropped
+  // paint before the screen stays stale long enough to be noticed.
+  if (_lastIdleProbeMs > 0 && (now - _lastIdleProbeMs) < 2000)
+      return;
+
+  _lastIdleProbeMs = now;
+
+  const int before = _paintedUpdate;
+  repaint(contentsRect());
+  if (_paintedUpdate == before)
+  {
+      rlog("force-idle", _imgUpdates, _paintedUpdate);
+      forceRepaintNow();
+  }
+}
+
+// Paints the whole widget straight into its backing store.  update() and
+// repaint() both bail out when the platform claims the widget is not visible;
+// constructing a QPainter on the widget does not consult that answer at all,
+// which makes this the one path that cannot be silently swallowed.
+void TerminalDisplay::forceRepaintNow()
+{
+  if (_inPaint || !_image || _usedColumns <= 0 || _usedLines <= 0)
+      return;
+
+  _inPaint = true;
+  QTime forceClock;
+  forceClock.start();
+  QPainter paint(this);
+  if (paint.isActive())
+  {
+      drawBackground(paint, contentsRect(), palette().background().color(), true);
+      for (int y = 0; y < _usedLines; y++)
+          drawContents(paint, rowRect(y));
+      drawInputMethodPreeditString(paint, preeditRect());
+      paintFilters(paint);
+      paint.end();
+      ++_forceCount;
+      _paintedUpdate = _imgUpdates;
+      memcpy(_snapshot, _image, _usedLines * _columns * sizeof(Character));
+      _snapshotValid = true;
+      const int forceMs = forceClock.elapsed();
+      if (forceMs > 15)
+          rlog("force-ms", forceMs, 0);
+  }
+  _inPaint = false;
+}
+
+int TerminalDisplay::textOriginX() const
+{
+  return contentsRect().left() + _leftMargin
+         + (_contentWidth - _columns * _fontWidth) / 2;
+}
+
+// One grid row, in widget coordinates.  Same origin as drawContents(), so the
+// row maps back to exactly the cells it should: (rect.top() - top) / fontHeight
+// must give the row index back unchanged.
+QRect TerminalDisplay::rowRect(int row) const
+{
+  return QRect(textOriginX(),
+               contentsRect().top() + _topMargin + _fontHeight * row,
+               _fontWidth * _usedColumns,
+               _fontHeight);
+}
+
+// The whole character grid, without the margins.
+QRect TerminalDisplay::textAreaRect() const
+{
+  return QRect(textOriginX(),
+               contentsRect().top() + _topMargin,
+               _fontWidth * _usedColumns,
+               _fontHeight * _usedLines);
+}
+
+QRect TerminalDisplay::imageToWidget(const QRect& imageArea) const{
 //qDebug("%s %d imageToWidget", __FILE__, __LINE__);
     QRect result;
-    result.setLeft( _leftMargin + _fontWidth * imageArea.left() );
-    result.setTop( _topMargin + _fontHeight * imageArea.top() );
+    result.setLeft( textOriginX() + _fontWidth * imageArea.left() );
+    result.setTop( contentsRect().top() + _topMargin + _fontHeight * imageArea.top() );
     result.setWidth( _fontWidth * imageArea.width() );
     result.setHeight( _fontHeight * imageArea.height() );
 
@@ -1473,6 +1865,15 @@ void TerminalDisplay::resizeEvent(QResizeEvent*)
   if (_imePanel && _imePanel->isOpen())
     _imePanel->popup();
 
+  if (_keyBar && _keyBar->isOpen())
+    _keyBar->popup();
+
+  if (_outputSuspendedLabel && _outputSuspendedLabel->isVisible()) {
+    _outputSuspendedLabel->adjustSize();
+    _outputSuspendedLabel->move((width() - _outputSuspendedLabel->width()) / 2, 8);
+    _outputSuspendedLabel->raise();
+  }
+
   if (_imeBadge && _imeBadge->isVisible()) {
     _imeBadge->adjustSize();
     _imeBadge->move(8, 8);
@@ -1502,6 +1903,49 @@ void TerminalDisplay::propagateSize()
   }
   if (_image)
      updateImageSize();
+}
+
+// --- data/imekey.log ------------------------------------------------------
+// One line per key that reaches the pinyin layer, per byte string the IME
+// writes, and per pty resize. It answers the two things a screenshot cannot:
+// did the key reach the application at all, and did the rows change under it
+// (a full-screen TUI redraws on SIGWINCH, which looks like "it keeps adding
+// lines"). Capped, so a long session cannot grow the file.
+static bool imeLogLine(const QString& line)
+{
+	// Off unless BGSHELL_IMELOG is set.  This used to run on every key that
+	// went through the pinyin layer and on every pty resize: open() + write()
+	// + close() per keystroke, which on eMMC costs both latency and flash.
+	static const bool enabled = !qgetenv("BGSHELL_IMELOG").isEmpty();
+	if (!enabled)
+		return false;
+
+	static int n = 0;
+	if (n > 800)
+		return false;
+	++n;
+	QFile f(QDir::current().absoluteFilePath(QString::fromLatin1("data/imekey.log")));
+	if (!f.open(QIODevice::WriteOnly | QIODevice::Append))
+		return false;
+	QTextStream ts(&f);
+	ts << QTime::currentTime().toString("HH:mm:ss.zzz") << ' ' << line << '\n';
+	return true;
+}
+
+static void imeTraceKey(const char* what, QKeyEvent* ev, int pre)
+{
+	imeLogLine(QString::fromLatin1(what)
+	           + " key=" + QString::number(ev->key())
+	           + " text=[" + ev->text().replace('\n', "\\n") + "]"
+	           + " mods=" + QString::number((int)ev->modifiers())
+	           + " rep=" + QString::number(ev->isAutoRepeat() ? 1 : 0)
+	           + " pre=" + QString::number(pre));
+}
+
+static void imeTraceBytes(const char* what, const char* p, int len)
+{
+	imeLogLine(QString::fromLatin1(what) + " len=" + QString::number(len)
+	           + " bytes=" + QString::fromLatin1(QByteArray(p, len).toHex()));
 }
 
 void TerminalDisplay::updateImageSize()
@@ -1535,6 +1979,8 @@ void TerminalDisplay::updateImageSize()
 
   if ( _resizing )
   {
+	  imeLogLine(QString("pty-size rows=%1 cols=%2 reserve=%3")
+	             .arg(_lines).arg(_columns).arg(_bottomReserve));
   	showResizeNotification();
     emit changedContentSizeSignal(_contentHeight, _contentWidth); // expose resizeEvent
   }
@@ -1550,6 +1996,16 @@ void TerminalDisplay::updateImageSize()
 //the same signal as the one for a content size change 
 void TerminalDisplay::showEvent(QShowEvent*)
 {
+    // Output arrived while this tab was in the background and updateImage()
+    // skipped it.  Catch up now, in one go: resize first (the grid may have
+    // changed while hidden) and then repaint everything.
+    if (_needsFullRepaint)
+    {
+        _needsFullRepaint = false;
+        updateImageSize();
+        updateImage();
+        update();
+    }
     emit changedContentSizeSignal(_contentHeight,_contentWidth);
 }
 void TerminalDisplay::hideEvent(QHideEvent*)
@@ -1621,8 +2077,51 @@ void TerminalDisplay::setScrollBarPosition(ScrollBarPosition position)
   update();
 }
 
+// Diagnostics for the touch/drag work: a capped number of lines into
+// data/touchdrag.log, so a long session cannot grow the file.
+static void tsTrace(const char* what, int a = 0, int b = 0)
+{
+  static int n = 0;
+  if (n > 300)
+    return;
+  ++n;
+  QFile f(QDir::current().absoluteFilePath(QString::fromLatin1("data/touchdrag.log")));
+  if (!f.open(QIODevice::WriteOnly | QIODevice::Append))
+    return;
+  QTextStream ts(&f);
+  ts << QTime::currentTime().toString("HH:mm:ss.zzz") << ' '
+     << QString::fromLatin1(what) << " a=" << a << " b=" << b << '\n';
+}
+
 void TerminalDisplay::mousePressEvent(QMouseEvent* ev)
 {
+  // A finger on BB10 arrives here as a plain mouse drag - the platform sends
+  // QTouchEvent only for the two-finger gestures - so the single-finger
+  // gestures (tap, drag-to-scroll, double tap, long press) are handled on
+  // this path. Blocking the mouse events here would leave the finger with
+  // no working gesture at all.
+
+  if (ev->button() == Qt::LeftButton)
+  {
+    _tsStart     = ev->pos();
+    _tsMoved     = false;
+    _tsScrolling = false;
+    _tsLongFired = false;
+    _tsScrollAcc = 0;
+    _tsDragLastY = ev->pos().y();
+    _tsLongStage = 0;
+    _tsMenuShown = false;
+    tsTrace("press", ev->pos().y(), _scrollBar->value());
+
+    if (!_tsLongTimer)
+    {
+      _tsLongTimer = new QTimer(this);
+      _tsLongTimer->setSingleShot(true);
+      connect(_tsLongTimer, SIGNAL(timeout()), this, SLOT(onTouchLongPress()));
+    }
+    _tsLongTimer->start(kHoldLineMs);
+  }
+
   if ( _possibleTripleClick && (ev->button()==Qt::LeftButton) ) {
     mouseTripleClickEvent(ev);
     return;
@@ -1713,6 +2212,66 @@ QList<QAction*> TerminalDisplay::filterActions(const QPoint& position)
 
 void TerminalDisplay::mouseMoveEvent(QMouseEvent* ev)
 {
+  // BB10 delivers the finger as a plain mouse drag (no QTouchEvent at all
+  // on this platform), so the scroll gesture has to be recognised here.
+  // Once the press has travelled past the tap slop it is a scroll and can
+  // no longer turn into a selection halfway down the screen.
+  if ((ev->buttons() & Qt::LeftButton) && _tsLongFired)
+  {
+    if (!_tsMoved && (ev->pos() - _tsStart).manhattanLength() > 12)
+    {
+      _tsMoved = true;
+      _tsLongTimer->stop();
+      tsTrace("longpress-select", ev->pos().y(), 0);
+    }
+    if (_tsMoved)
+    {
+      extendTouchSelection(ev->pos());
+      ev->accept();
+      return;
+    }
+    // Long press fired but the finger has not left the tap slop yet: this is
+    // neither a scroll nor a selection, and it must not fall through to the
+    // mouseSignal branch below - vim/htop would see phantom drag events.
+    ev->accept();
+    return;
+  }
+
+  if ((ev->buttons() & Qt::LeftButton) && !_tsLongFired)
+  {
+    if (!_tsMoved && (ev->pos() - _tsStart).manhattanLength() > 12)
+    {
+      _tsMoved     = true;
+      _tsScrolling = true;
+      _tsScrollAcc = 0;
+      _tsDragLastY = _tsStart.y();
+      _actSel      = 0;
+      if (_tsLongTimer)
+        _tsLongTimer->stop();
+      if (_screenWindow)
+        _screenWindow->clearSelection();
+      tsTrace("scroll-begin", _fontHeight, _scrollBar->maximum());
+      update();
+    }
+
+    if (_tsScrolling)
+    {
+      qreal step = (_fontHeight > 4) ? _fontHeight : 20;
+      _tsScrollAcc += (_tsDragLastY - ev->pos().y());   // finger up => forward
+      _tsDragLastY = ev->pos().y();
+      int lines = (int)(_tsScrollAcc / step);
+      if (lines != 0)
+      {
+        _tsScrollAcc -= lines * step;
+        if (!scrollAlternateScreen(lines))
+          _scrollBar->setValue(_scrollBar->value() + lines);
+        update();
+      }
+      ev->accept();
+      return;
+    }
+  }
+
   int charLine = 0;
   int charColumn = 0;
 
@@ -1829,10 +2388,10 @@ void TerminalDisplay::extendSelection( const QPoint& position )
 
   // Adjust position within text area bounds. See FIXME above.
   QPoint oldpos = pos;
-  if ( pos.x() < tLx+_leftMargin )                  
-      pos.setX( tLx+_leftMargin );
-  if ( pos.x() > tLx+_leftMargin+_usedColumns*_fontWidth-1 ) 
-      pos.setX( tLx+_leftMargin+_usedColumns*_fontWidth );
+  if ( pos.x() < textOriginX() )                  
+      pos.setX( textOriginX() );
+  if ( pos.x() > textOriginX()+_usedColumns*_fontWidth-1 ) 
+      pos.setX( textOriginX()+_usedColumns*_fontWidth );
   if ( pos.y() < tLy+_topMargin )                   
       pos.setY( tLy+_topMargin );
   if ( pos.y() > tLy+_topMargin+_usedLines*_fontHeight-1 )    
@@ -1874,9 +2433,9 @@ void TerminalDisplay::extendSelection( const QPoint& position )
     // Find left (left_not_right ? from here : from start)
     QPoint left = left_not_right ? here : _iPntSelCorr;
     i = loc(left.x(),left.y());
-    if (i>=0 && i<=_imageSize) {
+    if (i>=0 && i<_imageSize) {
       selClass = charClass(_image[i].character);
-      while ( ((left.x()>0) || (left.y()>0 && (_lineProperties[left.y()-1] & LINE_WRAPPED) )) 
+      while ( i > 0 && ((left.x()>0) || (left.y()>0 && (_lineProperties[left.y()-1] & LINE_WRAPPED) )) 
 					  && charClass(_image[i-1].character) == selClass )
       { i--; if (left.x()>0) left.rx()--; else {left.rx()=_usedColumns-1; left.ry()--;} }
     }
@@ -1884,9 +2443,9 @@ void TerminalDisplay::extendSelection( const QPoint& position )
     // Find left (left_not_right ? from start : from here)
     QPoint right = left_not_right ? _iPntSelCorr : here;
     i = loc(right.x(),right.y());
-    if (i>=0 && i<=_imageSize) {
+    if (i>=0 && i<_imageSize) {
       selClass = charClass(_image[i].character);
-      while( ((right.x()<_usedColumns-1) || (right.y()<_usedLines-1 && (_lineProperties[right.y()] & LINE_WRAPPED) )) 
+      while( i+1 < _imageSize && ((right.x()<_usedColumns-1) || (right.y()<_usedLines-1 && (_lineProperties[right.y()] & LINE_WRAPPED) )) 
 					  && charClass(_image[i+1].character) == selClass )
       { i++; if (right.x()<_usedColumns-1) right.rx()++; else {right.rx()=0; right.ry()++; } }
     }
@@ -1956,11 +2515,11 @@ void TerminalDisplay::extendSelection( const QPoint& position )
     if ( right.x() > 0 && !_columnSelectionMode )
     {
       i = loc(right.x(),right.y());
-      if (i>=0 && i<=_imageSize) {
+      if (i>=0 && i<_imageSize) {
         selClass = charClass(_image[i-1].character);
         if (selClass == ' ')
         {
-          while ( right.x() < _usedColumns-1 && charClass(_image[i+1].character) == selClass && (right.y()<_usedLines-1) && 
+          while ( i+1 < _imageSize && right.x() < _usedColumns-1 && charClass(_image[i+1].character) == selClass && (right.y()<_usedLines-1) && 
 						  !(_lineProperties[right.y()] & LINE_WRAPPED))
           { i++; right.rx()++; }
           if (right.x() < _usedColumns-1)
@@ -2016,6 +2575,48 @@ void TerminalDisplay::extendSelection( const QPoint& position )
 
 void TerminalDisplay::mouseReleaseEvent(QMouseEvent* ev)
 {
+    if (_tsLongTimer)
+        _tsLongTimer->stop();
+
+    // The hold timer may already have opened the menu while the finger was
+    // still down. This release belongs to that press: swallow it, otherwise
+    // the menu that sits below the finger takes it as a click on entry one.
+    if (ev->button() == Qt::LeftButton && _tsMenuShown)
+    {
+        _tsMenuShown = false;
+        _tsLongFired = false;
+        _tsLongStage = 0;
+        ev->accept();
+        return;
+    }
+
+    // A long press that did not turn into a drag opens the copy/paste menu
+    // here, on release: a menu popped while the finger is still down would
+    // take that release as a click on its first entry.
+    if (ev->button() == Qt::LeftButton && _tsLongFired && !_tsScrolling && !_tsMoved)
+    {
+        _tsLongFired = false;
+        _actSel      = 0;
+        dragInfo.state = diNone;
+        tsTrace("longpress-menu", _tsStart.y(), 0);
+        showTouchMenu(_tsStart);
+        ev->accept();
+        return;
+    }
+
+    if (_tsScrolling || _tsMoved)
+    {
+        _tsScrolling = false;
+        _tsMoved     = false;
+        _tsLongFired = false;
+        _actSel      = 0;
+        dragInfo.state = diNone;
+        emit isBusySelecting(false);
+        tsTrace("scroll-end", _scrollBar->value(), _scrollBar->maximum());
+        ev->accept();
+        return;
+    }
+
     if ( !_screenWindow )
         return;
 
@@ -2068,7 +2669,7 @@ void TerminalDisplay::mouseReleaseEvent(QMouseEvent* ev)
 void TerminalDisplay::getCharacterPosition(const QPoint& widgetPoint,int& line,int& column) const
 {
 
-    column = (widgetPoint.x() + _fontWidth/2 -contentsRect().left()-_leftMargin) / _fontWidth;
+    column = (widgetPoint.x() + _fontWidth/2 - textOriginX()) / _fontWidth;
     line = (widgetPoint.y()-contentsRect().top()-_topMargin) / _fontHeight;
 
     if ( line < 0 )
@@ -2098,87 +2699,24 @@ void TerminalDisplay::updateLineProperties()
 
 void TerminalDisplay::mouseDoubleClickEvent(QMouseEvent* ev)
 {
+
   if ( ev->button() != Qt::LeftButton) return;
   if ( !_screenWindow ) return;
 
-  int charLine = 0;
-  int charColumn = 0;
-
-  getCharacterPosition(ev->pos(),charLine,charColumn);
-
-  QPoint pos(charColumn,charLine);
-
-  // pass on double click as two clicks.
+  // pass on double click as one click when the application owns the mouse
   if (!_mouseMarks && !(ev->modifiers() & Qt::ShiftModifier))
   {
-    // Send just _ONE_ click event, since the first click of the double click
-    // was already sent by the click handler
-    emit mouseSignal( 0, 
-                      pos.x()+1, 
-                      pos.y()+1 +_scrollBar->value() -_scrollBar->maximum(),
-                      0 ); // left button
+    int charLine = 0;
+    int charColumn = 0;
+    getCharacterPosition(ev->pos(),charLine,charColumn);
+    emit mouseSignal( 0,
+                      charColumn + 1,
+                      charLine + 1 +_scrollBar->value() -_scrollBar->maximum(),
+                      0 );
     return;
   }
 
-  _screenWindow->clearSelection();
-  QPoint bgnSel = pos;
-  QPoint endSel = pos;
-  int i = loc(bgnSel.x(),bgnSel.y());
-  _iPntSel = bgnSel;
-  _iPntSel.ry() += _scrollBar->value();
-
-  _wordSelectionMode = true;
-
-  // find word boundaries...
-  int selClass = charClass(_image[i].character);
-  {
-     // find the start of the word
-     int x = bgnSel.x();
-     while ( ((x>0) || (bgnSel.y()>0 && (_lineProperties[bgnSel.y()-1] & LINE_WRAPPED) )) 
-					 && charClass(_image[i-1].character) == selClass )
-     {  
-       i--; 
-       if (x>0) 
-           x--; 
-       else 
-       {
-           x=_usedColumns-1; 
-           bgnSel.ry()--;
-       } 
-     }
-
-     bgnSel.setX(x);
-     _screenWindow->setSelectionStart( bgnSel.x() , bgnSel.y() , false );
-
-     // find the end of the word
-     i = loc( endSel.x(), endSel.y() );
-     x = endSel.x();
-     while( ((x<_usedColumns-1) || (endSel.y()<_usedLines-1 && (_lineProperties[endSel.y()] & LINE_WRAPPED) )) 
-					 && charClass(_image[i+1].character) == selClass )
-     { 
-         i++; 
-         if (x<_usedColumns-1) 
-             x++; 
-         else 
-         {  
-             x=0; 
-             endSel.ry()++; 
-         } 
-     }
-
-     endSel.setX(x);
-
-     // In word selection mode don't select @ (64) if at end of word.
-     if ( ( QChar( _image[i].character ) == '@' ) && ( ( endSel.x() - bgnSel.x() ) > 0 ) )
-       endSel.setX( x - 1 );
-
-
-     _actSel = 2; // within selection
-     
-     _screenWindow->setSelectionEnd( endSel.x() , endSel.y() );
-    
-     setSelection( _screenWindow->selectedText(_preserveLineBreaks) ); 
-   }
+  selectWordAt( ev->pos() );
 
   _possibleTripleClick=true;
 
@@ -2186,10 +2724,71 @@ void TerminalDisplay::mouseDoubleClickEvent(QMouseEvent* ev)
                      SLOT(tripleClickTimeout()));
 }
 
+// vi, less, top, mc, claude, pi ... all run on the alternate screen, which is
+// created without a history scroll (Emulation only ever calls setScroll() on
+// _screen[0]).  Dragging or wheeling the viewport there changes nothing,
+// because the scroll bar's range is 0 - it looks like the terminal simply
+// refuses to scroll.
+//
+// xterm has the same situation and solves it with "alternate scroll" (DECSET
+// 1007, on by default): a wheel notch becomes an Up/Down key press, so the
+// application scrolls itself.  We do the same, and if the application asked
+// for mouse tracking we send the wheel buttons it is waiting for instead.
+//
+// lines > 0 scrolls forward (finger up), < 0 backward.  Returns true when the
+// gesture was consumed; false means the caller should scroll normally.
+bool TerminalDisplay::scrollAlternateScreen(int lines)
+{
+	if (!_screenWindow)
+		return false;
+
+	Screen* scr = _screenWindow->screen();
+	if (!scr || !scr->isAlternateScreen())
+		return false;
+
+	if (lines == 0)
+		return true;      // alternate screen: never fall back to the 0-range bar
+
+	// One key per line, but capped: a fast flick must not fire forty of them.
+	int n = qAbs(lines);
+	if (n > 10)
+		n = 10;
+
+	if (!_mouseMarks)
+	{
+		// The application asked for mouse reports (claude, pi, mc ...): send
+		// real wheel events, button 4 = up, 5 = down.  Arrow keys here would
+		// walk its input history instead of scrolling the view - which is
+		// exactly the "drag selects text in the prompt" complaint.
+		const int cx = (_usedColumns > 1) ? _usedColumns / 2 : 1;
+		const int cy = (_usedLines   > 1) ? _usedLines   / 2 : 1;
+		for (int i = 0; i < n; ++i)
+			emit mouseSignal(lines > 0 ? 5 : 4, cx, cy, 0);
+		return true;
+	}
+
+	// Every other pager (less, man, vim without mouse) scrolls with the cursor
+	// keys - this is xterm's alternateScroll behaviour.
+	const char up[3]   = { 0x1b, '[', 'A' };
+	const char down[3] = { 0x1b, '[', 'B' };
+	const char* seq = (lines > 0) ? down : up;
+	for (int i = 0; i < n; ++i)
+		writeInputBytes(seq, 3);
+	return true;
+}
+
 void TerminalDisplay::wheelEvent( QWheelEvent* ev )
 {
   if (ev->orientation() != Qt::Vertical)
     return;
+
+  // The alternate screen has no scrollback: hand the wheel to the app.
+  // One notch = three lines, which is what xterm's alternateScroll does.
+  if (scrollAlternateScreen(ev->delta() > 0 ? -3 : 3))
+  {
+    ev->accept();
+    return;
+  }
 
   if ( _mouseMarks )
     _scrollBar->event(ev);
@@ -2299,12 +2898,12 @@ void TerminalDisplay::setWordCharacters(const QString& wc)
 
 void TerminalDisplay::setUsesMouse(bool on)
 {
-  _mouseMarks = on;
+  _mouseMarks = !on;
   setCursor( _mouseMarks ? Qt::IBeamCursor : Qt::ArrowCursor );
 }
 bool TerminalDisplay::usesMouse() const
 {
-    return _mouseMarks;
+    return !_mouseMarks;
 }
 
 /* ------------------------------------------------------------------------- */
@@ -2418,24 +3017,42 @@ void TerminalDisplay::setFlowControlWarningEnabled( bool enable )
 // ---------------------------------------------------------------------------
 // Term50-style key layer, ported from Term50's metamode/chord scheme.
 //
-// The on-screen soft-key bar (Ctrl+ / Tab / < / > / ^ / v / Esc) is gone:
-//   * double-tap the physical Right arrow (<= META_DOUBLE_TAP_MS) arms a
-//     sticky layer; a single tap still sends cursor-right, so arrows work;
-//   * inside the layer the Term50 metamode letters fire their actions and
-//     any other key becomes Ctrl+<key>, so the layer is also the Ctrl key;
-//   * h/j/k/l and the arrow keys stay inside the layer (Term50 sticky).
+// The on-screen soft-key bar (Ctrl+ / Tab / < / > / ^ / v / Esc) is gone.
+// The right Shift is the Ctrl key, hold-only: press and hold it, hit a key,
+// release.  No sticky layer, no badge, no waiting - a latched layer that
+// hijacked e (Esc), v (paste) and i/o (font size) was far too easy to trip
+// by accident on a phone keypad, and the CTRL badge it lit sat in the corner
+// until it was double-tapped again, which read as "the terminal is stuck".
 // ---------------------------------------------------------------------------
-#define META_DOUBLE_TAP_MS     500
+// How long after a commit an auto-repeating key still counts as part of
+// the word that was just committed (see handleImeKey).
+#define IME_COMMIT_GUARD_MS    400
 #define META_DEFAULT_FONT_SIZE 22
 
 // QNX keycode of the BB10 SYM key (Term50 src/terminal.h KEYCODE_BB_SYM_KEY).
 // Qt has no mapping for it, so it arrives as an unmapped key / bare Escape.
 #define TD_KEYCODE_BB_SYM      0xF0D3
 
-static void td_write_bytes(const char *b, int n)
+// Every byte the terminal produces for the shell goes through here.
+//
+// It used to write straight to gActiveFd, the pty of whichever tab happened
+// to be in front at the moment of the write.  That is fine for a keystroke
+// that is handled the instant it arrives, but not for anything that was
+// already sitting in the event queue when the user switched tabs: a key
+// pressed just before the switch could be typed into the *new* tab's shell.
+// Each display now owns a pointer to its own session and writes there.
+void TerminalDisplay::writeInputBytes(const char *b, int n)
 {
-	if (masterFdG >= 0 && n > 0)
-		write(masterFdG, b, n);
+	if (n <= 0)
+		return;
+	if (_inputSession) {
+		_inputSession->send(b, n);
+		return;
+	}
+	// No session attached (should not happen for tab widgets): keep the old
+	// behaviour so nothing silently stops working.
+	if (gActiveFd >= 0)
+		write(gActiveFd, b, n);
 }
 
 // True when this key event comes from the right-hand Shift key. On BB10 both
@@ -2454,27 +3071,27 @@ static bool td_isRightShift(QKeyEvent *event)
 }
 
 // Send Ctrl+<key> for the key being held down while right Shift is held.
-static void td_send_ctrl_key(QKeyEvent *event)
+void TerminalDisplay::sendCtrlKey(QKeyEvent *event)
 {
 	const int key = event->key();
 	unsigned char c = 0;
 
 	switch (key) {
-	case Qt::Key_Left:     { const char s[] = {0x1b, '[', '1', ';', '5', 'D'}; td_write_bytes(s, 6); return; }
-	case Qt::Key_Right:    { const char s[] = {0x1b, '[', '1', ';', '5', 'C'}; td_write_bytes(s, 6); return; }
-	case Qt::Key_Up:       { const char s[] = {0x1b, '[', '1', ';', '5', 'A'}; td_write_bytes(s, 6); return; }
-	case Qt::Key_Down:     { const char s[] = {0x1b, '[', '1', ';', '5', 'B'}; td_write_bytes(s, 6); return; }
-	case Qt::Key_Home:     { const char s[] = {0x1b, '[', '1', ';', '5', 'H'}; td_write_bytes(s, 6); return; }
-	case Qt::Key_End:      { const char s[] = {0x1b, '[', '1', ';', '5', 'F'}; td_write_bytes(s, 6); return; }
-	case Qt::Key_Delete:   { const char s[] = {0x1b, '[', '3', ';', '5', '~'}; td_write_bytes(s, 6); return; }
-	case Qt::Key_PageUp:   { const char s[] = {0x1b, '[', '5', ';', '5', '~'}; td_write_bytes(s, 6); return; }
-	case Qt::Key_PageDown: { const char s[] = {0x1b, '[', '6', ';', '5', '~'}; td_write_bytes(s, 6); return; }
+	case Qt::Key_Left:     { const char s[] = {0x1b, '[', '1', ';', '5', 'D'}; writeInputBytes(s, 6); return; }
+	case Qt::Key_Right:    { const char s[] = {0x1b, '[', '1', ';', '5', 'C'}; writeInputBytes(s, 6); return; }
+	case Qt::Key_Up:       { const char s[] = {0x1b, '[', '1', ';', '5', 'A'}; writeInputBytes(s, 6); return; }
+	case Qt::Key_Down:     { const char s[] = {0x1b, '[', '1', ';', '5', 'B'}; writeInputBytes(s, 6); return; }
+	case Qt::Key_Home:     { const char s[] = {0x1b, '[', '1', ';', '5', 'H'}; writeInputBytes(s, 6); return; }
+	case Qt::Key_End:      { const char s[] = {0x1b, '[', '1', ';', '5', 'F'}; writeInputBytes(s, 6); return; }
+	case Qt::Key_Delete:   { const char s[] = {0x1b, '[', '3', ';', '5', '~'}; writeInputBytes(s, 6); return; }
+	case Qt::Key_PageUp:   { const char s[] = {0x1b, '[', '5', ';', '5', '~'}; writeInputBytes(s, 6); return; }
+	case Qt::Key_PageDown: { const char s[] = {0x1b, '[', '6', ';', '5', '~'}; writeInputBytes(s, 6); return; }
 	case Qt::Key_Return:
 	case Qt::Key_Enter:    c = 0x0d; break;
 	case Qt::Key_Backspace:c = 0x08; break;
 	case Qt::Key_Tab:      c = 0x09; break;
 	case Qt::Key_Escape:   c = 0x1b; break;
-	case Qt::Key_Space:    { const char z = 0; td_write_bytes(&z, 1); return; }
+	case Qt::Key_Space:    { const char z = 0; writeInputBytes(&z, 1); return; }
 	default:
 		// A-Z, [ \ ] ^ _ all live in 0x40..0x5f, and Ctrl+<key> is key-0x40
 		// (Ctrl+C = 0x03, Ctrl+D = 0x04, Ctrl+] = 0x1d ...)
@@ -2484,7 +3101,7 @@ static void td_send_ctrl_key(QKeyEvent *event)
 	}
 
 	if (c)
-		td_write_bytes((const char *)&c, 1);
+		writeInputBytes((const char *)&c, 1);
 }
 
 void TerminalDisplay::setMetaLayer(bool on)
@@ -2494,9 +3111,15 @@ void TerminalDisplay::setMetaLayer(bool on)
 	if (!_metaBadge) {
 		_metaBadge = new QLabel(this);
 		_metaBadge->setText(QString("CTRL"));
+		// Same treatment as a pressed keycap: solid accent, dark ink.  The
+		// old black plate with a neon outline was the last survivor of the
+		// palette the key strip used to carry.
 		_metaBadge->setStyleSheet(QString(
-		    "QLabel { background-color: rgba(0,0,0,200); color: #00ff66;"
-		    " border: 1px solid #00ff66; padding: 2px 8px; }"));
+		    "QLabel { background-color: %1; color: %2; border: 1px solid %1;"
+		    " border-radius: 6px; padding: 2px 8px; font-weight: bold;"
+		    " letter-spacing: 1px; }")
+		    .arg(UiTheme::hex(UiTheme::Accent),
+		         UiTheme::hex(UiTheme::AccentInk)));
 		_metaBadge->setAttribute(Qt::WA_TransparentForMouseEvents, true);
 		_metaBadge->setFocusPolicy(Qt::NoFocus);
 		_metaBadge->adjustSize();
@@ -2543,24 +3166,18 @@ void TerminalDisplay::showBindingHelp()
 	help += QString::fromUtf8("（BB10 手机没有方向键，印着上箭头的那个键就是 Shift）\n\n");
 	help += QString::fromUtf8("  按住右 Shift + <键> -> Ctrl + <键>\n");
 	help += QString::fromUtf8("      c=Ctrl+C  d=Ctrl+D  z=Ctrl+Z  l=Ctrl+L\n");
-	help += QString::fromUtf8("  双击右 Shift        -> 锁定 CTRL 层\n");
-	help += QString::fromUtf8("      （中间不能输入任何字符）\n");
+	help += QString::fromUtf8("      Esc = Ctrl+[   Tab = Ctrl+I\n");
+	help += QString::fromUtf8("  松开右 Shift 立即恢复普通输入（无锁定、无等待）\n");
 	help += QString::fromUtf8("  左 Shift 始终是普通 Shift\n\n");
-	help += QString::fromUtf8("CTRL 层内：\n");
-	help += QString::fromUtf8("  e    Esc               s   Ctrl+L（重画屏幕）\n");
-	help += QString::fromUtf8("  v    粘贴剪贴板        ?   本帮助\n");
-	help += QString::fromUtf8("  i    字体变大          o   字体变小\n");
-	help += QString::fromUtf8("  z    字体复原          r   重载设置\n");
-	help += QString::fromUtf8("  h/j/k/l   左/下/上/右（仍留在层内）\n");
-	help += QString::fromUtf8("  其它键 -> Ctrl+<键>，随后退出该层\n\n");
 	help += QString::fromUtf8("SYM = 符号面板（点格子，或按对应字母）\n");
 	help += QString::fromUtf8("      q~ w` e{ r} t[ y] u< i> o^ p%\n");
-	help += QString::fromUtf8("      a= s- d* f/ g\\ h| j& k' l\"\n\n");
+	help += QString::fromUtf8("      a= s- d* f/ g\\ h| j& k' l\"\n");
+	help += QString::fromUtf8("     底部：Esc / Tab / Shift+Tab\n\n");
 	help += QString::fromUtf8("Alt+Enter = 中文/EN 输入法   Alt+Space = Tab\n");
 	help += QString::fromUtf8("Ctrl+Space = 同样的输入法开关\n");
-	help += QString::fromUtf8("Shift+Alt+<键> = Ctrl+<键>\n");
-	help += QString::fromUtf8("双击右方向键也能切换该层（仅外接键盘）\n\n");
+	help += QString::fromUtf8("Shift+Alt+<键> = Ctrl+<键>\n\n");
 	help += QString::fromUtf8("下滑菜单 -> 命令 / SSH：保存的常用命令与主机\n");
+	help += QString::fromUtf8("     上滑收回，或点一下终端\n");
 	help += QString::fromUtf8("  点一行，然后 运行 / 仅插入 / 连接\n");
 	help += QString::fromUtf8("  连接自带 30 秒保活，掉线后顶部出现 重连 横条\n\n");
 	help += QString::fromUtf8("粘贴多行内容会先问一次：\n");
@@ -2577,6 +3194,7 @@ void TerminalDisplay::showBindingHelp()
 	help += QString::fromUtf8("  = . >   下一页      - , <  上一页\n");
 	help += QString::fromUtf8("          （候选条有第二页时才有效）\n");
 	help += QString::fromUtf8("  点      候选条上的候选字 / < > 箭头\n");
+	help += QString::fromUtf8("          候选条占终端下方两行，不遮住光标行\n");
 	help += QString::fromUtf8("  Enter   按英文字母直接上屏（不切换）\n");
 	help += QString::fromUtf8("  Esc     放弃组字（什么都不发送）\n");
 	help += QString::fromUtf8("  触控板（Q20/Q10/Q5/Classic）：左右选候选，\n");
@@ -2633,14 +3251,14 @@ void TerminalDisplay::handleMetaKey(QKeyEvent *event)
 
 	switch (key) {
 	/* --- Term50 metamode_keys: sticky arrow keys (k/j/l/h) ------------- */
-	case Qt::Key_H: { const char s[] = {0x1b, '[', 'D'}; td_write_bytes(s, 3); keep = true; break; }
-	case Qt::Key_J: { const char s[] = {0x1b, '[', 'B'}; td_write_bytes(s, 3); keep = true; break; }
-	case Qt::Key_K: { const char s[] = {0x1b, '[', 'A'}; td_write_bytes(s, 3); keep = true; break; }
-	case Qt::Key_L: { const char s[] = {0x1b, '[', 'C'}; td_write_bytes(s, 3); keep = true; break; }
-	case Qt::Key_Left:  { const char s[] = {0x1b, '[', 'D'}; td_write_bytes(s, 3); keep = true; break; }
-	case Qt::Key_Right: { const char s[] = {0x1b, '[', 'C'}; td_write_bytes(s, 3); keep = true; break; }
-	case Qt::Key_Up:    { const char s[] = {0x1b, '[', 'A'}; td_write_bytes(s, 3); keep = true; break; }
-	case Qt::Key_Down:  { const char s[] = {0x1b, '[', 'B'}; td_write_bytes(s, 3); keep = true; break; }
+	case Qt::Key_H: { const char s[] = {0x1b, '[', 'D'}; writeInputBytes(s, 3); keep = true; break; }
+	case Qt::Key_J: { const char s[] = {0x1b, '[', 'B'}; writeInputBytes(s, 3); keep = true; break; }
+	case Qt::Key_K: { const char s[] = {0x1b, '[', 'A'}; writeInputBytes(s, 3); keep = true; break; }
+	case Qt::Key_L: { const char s[] = {0x1b, '[', 'C'}; writeInputBytes(s, 3); keep = true; break; }
+	case Qt::Key_Left:  { const char s[] = {0x1b, '[', 'D'}; writeInputBytes(s, 3); keep = true; break; }
+	case Qt::Key_Right: { const char s[] = {0x1b, '[', 'C'}; writeInputBytes(s, 3); keep = true; break; }
+	case Qt::Key_Up:    { const char s[] = {0x1b, '[', 'A'}; writeInputBytes(s, 3); keep = true; break; }
+	case Qt::Key_Down:  { const char s[] = {0x1b, '[', 'B'}; writeInputBytes(s, 3); keep = true; break; }
 
 	/* --- Term50 metamode_keys: one-shot actions ----------------------- */
 	case Qt::Key_E: c = 0x1b; break;                       /* Esc             */
@@ -2673,7 +3291,7 @@ void TerminalDisplay::handleMetaKey(QKeyEvent *event)
 	}
 
 	if (c)
-		td_write_bytes((const char *)&c, 1);
+		writeInputBytes((const char *)&c, 1);
 	if (!keep)
 		setMetaLayer(false);
 	event->accept();
@@ -2688,6 +3306,8 @@ void TerminalDisplay::showSymbolPanel()
 		_symPanel = new CSymbolPanel(this);
 		connect(_symPanel, SIGNAL(symbolChosen(QString)),
 		        this, SLOT(onSymbolChosen(QString)));
+		connect(_symPanel, SIGNAL(controlKeyChosen(QString,bool)),
+		        this, SLOT(onSymbolControlKey(QString,bool)));
 	}
 	_symPanel->popup();
 }
@@ -2699,10 +3319,22 @@ void TerminalDisplay::closeSymbolPanel()
 	setFocus();
 }
 
+// Esc / Tab / Shift+Tab tapped in the symbol grid: raw bytes to the pty.
+// Tab keeps the grid up so it can be tapped a few times in a row.
+void TerminalDisplay::onSymbolControlKey(const QString &bytes, bool keepOpen)
+{
+	const QByteArray raw = bytes.toUtf8();
+	writeInputBytes(raw.constData(), raw.size());
+	if (keepOpen)
+		setFocus();
+	else
+		closeSymbolPanel();
+}
+
 void TerminalDisplay::insertSymbolText(const QString &text)
 {
 	const QByteArray utf8 = text.toUtf8();
-	td_write_bytes(utf8.constData(), utf8.size());
+	writeInputBytes(utf8.constData(), utf8.size());
 	closeSymbolPanel();
 }
 
@@ -2787,32 +3419,21 @@ void TerminalDisplay::setImeMode(bool on)
 		        this, SLOT(onImePageRequested(int)));
 	}
 
-	if (!_imeBadge) {
-		_imeBadge = new QLabel(this);
-		_imeBadge->setStyleSheet(QString(
-		    "QLabel { background-color: rgba(0,0,0,200); color: #00ff66;"
-		    " border: 1px solid #00ff66; padding: 2px 8px; }"));
-		_imeBadge->setAttribute(Qt::WA_TransparentForMouseEvents, true);
-		_imeBadge->setFocusPolicy(Qt::NoFocus);
-		_imeBadge->setText(QString::fromUtf8("中"));
-		if (!gTerminalFontFamily.isEmpty()) {
-			QFont badgeFont(gTerminalFontFamily);
-			badgeFont.setPixelSize(20);
-			_imeBadge->setFont(badgeFont);
-		}
-	}
-
 	cjk_ime_set_enabled(_ime, on ? 1 : 0);
 
 	if (on) {
-		_imeBadge->adjustSize();
-		_imeBadge->move(8, 8);
-		_imeBadge->raise();
-		_imeBadge->show();
+		// Keep the strip's height free under the last row for as long as the
+		// IME is on, not just while a composition runs: reserving and giving
+		// the space back on every committed word would resize the pty over
+		// and over and make full-screen programs redraw in a loop.
+		// Show the strip right away (idle state = the "拼音" hint), so turning
+		// the IME on gives immediate feedback instead of a silent two-row gap.
+		refreshBottomReserve();
+		refreshImePanel();
 	}
 	else {
-		_imeBadge->hide();
 		closeImePanel();
+		refreshBottomReserve();
 	}
 
 	QSettings settings;
@@ -2827,10 +3448,102 @@ void TerminalDisplay::toggleImeMode()
 	setImeMode(!_imeOn);
 }
 
+/* ------------------------------------------------------------------------- */
+/*                        custom key strip                                   */
+/* ------------------------------------------------------------------------- */
+
+// The key strip and the candidate strip both live under the last row, the
+// candidate strip on top of the key strip. The pty has to know about both, so
+// one place adds them up and reports the new row count.
+void TerminalDisplay::refreshBottomReserve()
+{
+	const int keyPx = (_keyBarOn && _keyBar) ? _keyBar->stripHeight() : 0;
+	const int imePx = (_imeOn && _imePanel) ? _imePanel->stripHeight() : 0;
+
+	if (_imePanel)
+		_imePanel->setBottomOffset(keyPx);
+
+	setBottomReserve(keyPx + imePx);
+
+	if (_keyBar && _keyBarOn)
+		_keyBar->popup();
+}
+
+void TerminalDisplay::setKeyBarEnabled(bool on)
+{
+	_keyBarOn = on;
+
+	if (!_keyBar) {
+		_keyBar = new CKeyBar(this);
+		connect(_keyBar, SIGNAL(keyClicked(QByteArray)),
+		        this, SLOT(onKeyBarClicked(QByteArray)));
+		_keyBar->setItems(CKeyBar::loadItems());
+	}
+
+	if (on) {
+		_keyBar->setItems(CKeyBar::loadItems());
+		_keyBar->popup();
+		_keyBar->raise();
+	}
+	else {
+		_keyBar->dismiss();
+	}
+
+	refreshBottomReserve();
+	if (_imeOn)
+		refreshImePanel();
+
+	QSettings settings;
+	settings.setValue(QString("KeyBarOn"), on);
+
+	update();
+}
+
+void TerminalDisplay::reloadKeyBar()
+{
+	if (!_keyBar)
+		return;
+	_keyBar->setItems(CKeyBar::loadItems());
+	_keyBar->update();
+}
+
+// A strip button is just a byte sequence; the pty does not care whether it
+// came from a key or from a tap.
+void TerminalDisplay::onKeyBarClicked(const QByteArray &bytes)
+{
+	if (bytes.isEmpty())
+		return;
+	sendToShell(bytes);
+}
+
 void TerminalDisplay::closeImePanel()
 {
 	if (_imePanel)
 		_imePanel->dismiss();
+}
+
+// The strip is drawn under the last row, not on top of it. Reserving the space
+// here makes calcGeometry() compute fewer rows; updateImageSize() then reports
+// the new size to the session, so the shell re-wraps exactly like it does when
+// the on-screen keyboard slides over the window.
+void TerminalDisplay::setBottomReserve(int px)
+{
+	if (px < 0)
+		px = 0;
+	if (px == _bottomReserve)
+		return;
+
+	_bottomReserve = px;
+
+	if (_image) {
+		// Reserving space is not a user resize: keep the size box quiet while
+		// recalculating rows/cols (which reports the new size to the session).
+		const bool wasSuppressed = _suppressSizeHint;
+		_suppressSizeHint = true;
+		updateImageSize();
+		_suppressSizeHint = wasSuppressed;
+		update();
+	}
 }
 
 void TerminalDisplay::refreshImePanel()
@@ -2838,14 +3551,14 @@ void TerminalDisplay::refreshImePanel()
 	if (!_ime || !_imePanel)
 		return;
 
-	if (cjk_ime_preedit(_ime)[0] == '\0') {
-		closeImePanel();
-		return;
-	}
-
-	_imePanel->setState(imePreeditText(_ime), imePageCandidates(_ime),
-	                    cjk_ime_candidate_page(_ime),
-	                    cjk_ime_candidate_page_count(_ime));
+	// An empty composition no longer hides the strip: the space under the last
+	// row is already reserved, so the strip stays as a small "拼音" hint
+	// instead of a blank band that appears and disappears at every word.
+	const bool idleMode = cjk_ime_preedit(_ime)[0] == '\0';
+	_imePanel->setState(idleMode ? QString() : imePreeditText(_ime),
+	                    idleMode ? QStringList() : imePageCandidates(_ime),
+	                    idleMode ? 0 : cjk_ime_candidate_page(_ime),
+	                    idleMode ? 0 : cjk_ime_candidate_page_count(_ime));
 	_imePanel->popup();
 }
 
@@ -2860,10 +3573,16 @@ void TerminalDisplay::sendImeSym(int sym)
 	size_t outLen = 0;
 	const int r = cjk_ime_handle_key(_ime, sym, 0, 1, out, sizeof(out), &outLen);
 
-	if (r == 2 && outLen > 0)
-		td_write_bytes(out, (int)outLen);
+	// The strip is what the eye follows: refresh it first, then write, then
+	// repaint the terminal at once so the character is not a round trip late.
 	if (r != 0)
 		refreshImePanel();
+	if (r == 2 && outLen > 0) {
+		imeTraceBytes("ime-commit", out, (int)outLen);
+		writeInputBytes(out, (int)outLen);
+		_imeCommitMs = QDateTime::currentMSecsSinceEpoch();
+		update();
+	}
 }
 
 void TerminalDisplay::onImeCandidateChosen(int index)
@@ -2883,9 +3602,19 @@ void TerminalDisplay::onImePageRequested(int delta)
 // it, otherwise the caller sends an arrow key as before.
 bool TerminalDisplay::imeTrackpadStep(int dx, int dy)
 {
-	if (!_imeOn || !_ime || !_imePanel || !_imePanel->isOpen())
+	const bool composing = _imeOn && _ime &&
+	                       cjk_ime_preedit(_ime)[0] != '\0';
+
+	// Nothing is being composed: the trackpad belongs to the key strip, so a
+	// Q10 / Q20 user can still reach Esc / Ctrl-C without a touchscreen.
+	if (!composing) {
+		if (_keyBarOn && _keyBar && _keyBar->isOpen()) {
+			if (dx != 0) { _keyBar->moveHighlight(dx > 0 ? 1 : -1); return true; }
+			if (dy != 0) { _keyBar->moveHighlight(dy > 0 ? 1 : -1); return true; }
+		}
 		return false;
-	if (cjk_ime_preedit(_ime)[0] == '\0')
+	}
+	if (!_imePanel || !_imePanel->isOpen())
 		return false;
 
 	if (dx != 0) {
@@ -2904,10 +3633,18 @@ bool TerminalDisplay::imeTrackpadStep(int dx, int dy)
 
 bool TerminalDisplay::imeTrackpadClick()
 {
-	if (!_imeOn || !_ime || !_imePanel || !_imePanel->isOpen())
-		return false;
-	_imePanel->commitHighlighted();
-	return true;
+	const bool composing = _imeOn && _ime &&
+	                       cjk_ime_preedit(_ime)[0] != '\0';
+
+	if (composing && _imePanel && _imePanel->isOpen()) {
+		_imePanel->commitHighlighted();
+		return true;
+	}
+	if (_keyBarOn && _keyBar && _keyBar->isOpen() && _keyBar->hasHighlight()) {
+		_keyBar->commitHighlighted();
+		return true;
+	}
+	return false;
 }
 
 /* ------------------------------------------------------------------------- */
@@ -2918,7 +3655,7 @@ void TerminalDisplay::sendToShell(const QByteArray &bytes)
 {
 	if (bytes.isEmpty())
 		return;
-	td_write_bytes(bytes.constData(), bytes.size());
+	writeInputBytes(bytes.constData(), bytes.size());
 }
 
 void TerminalDisplay::toggleCommandPanel()
@@ -2959,55 +3696,159 @@ void TerminalDisplay::runSshConnection(const QString &user, const QString &host,
                                        int port, const QString &identity,
                                        const QString &password)
 {
-	QString cmd = QString("ssh -o StrictHostKeyChecking=accept-new"
-	                      " -o ServerAliveInterval=30"   // keep the link alive
-	                      " -o ServerAliveCountMax=3"    // ~90 s before giving up
-	                      " -o TCPKeepAlive=yes");
-	if (port > 0 && port != 22)
-		cmd += QString(" -p %1").arg(port);
-	if (!identity.isEmpty()) {
-		QString key = identity;
-		if (key.contains(' '))
-			key = "'" + key + "'";
-		cmd += " -i " + key;
-	}
-	if (!user.isEmpty())
-		cmd += " " + user + "@" + host;
-	else
-		cmd += " " + host;
+    // accept-new only exists from OpenSSH 7.6 on.  An older client would stop
+    // at an interactive "yes/no" and the phone has no comfortable way to answer
+    // it, so fall back to plain "no" and keep our own known_hosts file.
+    const bool acceptNew = (gSshMajor > 7) || (gSshMajor == 7 && gSshMinor >= 6);
+    const QString knownHosts =
+        QDir::current().absoluteFilePath(QString("data/.ssh/known_hosts"));
 
-	if (_cmdPanel)
-		_cmdPanel->dismiss();
+    // Reading the password off /dev/tty is the fragile part: the sandbox does
+    // not always hand a controlling terminal to the child, and when it fails
+    // ssh gives up on the password method *without ever asking* - the user
+    // just sees "Permission denied (publickey,password)".  SSH_ASKPASS pushes
+    // the secret through a helper program instead, so the prompt is optional.
+    QString askpassPrefix;
+    const QString askpassPass =
+        QDir::current().absoluteFilePath(QString("data/.ssh/askpass.pass"));
+    if (!password.isEmpty()) {
+        const QString sshDir = QDir::current().absoluteFilePath(QString("data/.ssh"));
+        QDir().mkpath(sshDir);
+        const QString shFile = sshDir + "/askpass.sh";
 
-	sendToShell(cmd.toUtf8());
-	sendToShell(QByteArray(1, '\r'));
+        QFile pf(askpassPass);
+        if (pf.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+            pf.write(password.toUtf8());
+            pf.write("\n");
+            pf.close();
+            pf.setPermissions(QFile::ReadOwner | QFile::WriteOwner);
+        }
 
-	_sshTail.clear();
+        // The script carries the path, never the password, so nothing secret
+        // shows up in the shell command line (which stays in the scrollback
+        // and, worse, in bash's history file).
+        const QByteArray body = "#!/bin/sh\ncat '" + askpassPass.toUtf8() + "'\n";
+        QFile sf(shFile);
+        bool need = true;
+        if (sf.open(QIODevice::ReadOnly)) {
+            need = (sf.readAll() != body);
+            sf.close();
+        }
+        if (need && sf.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+            sf.write(body);
+            sf.close();
+            sf.setPermissions(QFile::ReadOwner | QFile::WriteOwner | QFile::ExeOwner);
+        }
+        // REQUIRE=force is OpenSSH 8.4+; older clients ignore it and fall back
+        // to the tty prompt, which is no worse than before.
+        askpassPrefix = "SSH_ASKPASS='" + shFile + "' SSH_ASKPASS_REQUIRE=force"
+                        " DISPLAY=:0 ";
+    }
 
-	// Remembered so the dropped-connection banner can offer "重连" without
-	// the user retyping anything.
-	_lastSshCmd      = cmd;
-	_lastSshUser     = user;
-	_lastSshHost     = host;
-	_lastSshPort     = port;
-	_lastSshIdentity = identity;
-	_lastSshPassword = password;
-	_dcShown         = false;
-	_dcTail.clear();
-	hideDisconnectBanner();
-	if (!password.isEmpty()) {
-		_sshPendingPwd = password;
-		if (!_sshPwdTimer) {
-			_sshPwdTimer = new QTimer(this);
-			_sshPwdTimer->setSingleShot(true);
-			connect(_sshPwdTimer, SIGNAL(timeout()),
-			        this, SLOT(clearPendingSshPassword()));
-		}
-		_sshPwdTimer->start(30000);
-	} else {
-		_sshPendingPwd.clear();
-	}
-	setFocus();
+    // Password auth only works end to end with a client that understands
+    // SSH_ASKPASS_REQUIRE (8.4+).  The system client on BB10 is ancient and
+    // silently falls back to the tty prompt - which is exactly the "nothing
+    // happens, then Permission denied" behaviour - so whenever a password is
+    // involved we drive our own bundled OpenSSH instead of PATH.
+    QString sshBin = "ssh";
+    QString libPrefix;
+    {
+        const QString bundled =
+            QDir::current().absoluteFilePath(QString("app/native/bin/ssh"));
+        const QString bundledLib =
+            QDir::current().absoluteFilePath(QString("app/native/lib"));
+        if (!password.isEmpty() && QFile::exists(bundled)) {
+            sshBin = "'" + bundled + "'";
+            libPrefix = "LD_LIBRARY_PATH='" + bundledLib + "':\"$LD_LIBRARY_PATH\" ";
+        }
+    }
+
+    // -v into a file (-E) keeps the screen readable while still leaving a
+    // trace of what the authentication phase actually tried; a bare
+    // "Permission denied" carries no information at all.
+    const QString sshLog =
+        QDir::current().absoluteFilePath(QString("data/ssh.log"));
+    if (QFileInfo(sshLog).size() > 262144)
+        QFile::remove(sshLog);
+
+    QString cmd = askpassPrefix + libPrefix + sshBin +
+                  QString(" -v -E '%1'"
+                          " -o StrictHostKeyChecking=%2"
+                          " -o UserKnownHostsFile='%3'")
+                      .arg(sshLog, acceptNew ? "accept-new" : "no", knownHosts);
+    cmd += " -o ServerAliveInterval=30"   // keep the link alive
+           " -o ServerAliveCountMax=3"    // ~90 s before giving up
+           " -o TCPKeepAlive=yes";
+    if (!password.isEmpty()) {
+        // A typed password means the user wants password auth: trying public
+        // keys first only burns the server's MaxAuthTries, and when the budget
+        // runs out ssh reports "Permission denied" before it ever asks.
+        cmd += " -o PubkeyAuthentication=no";
+        // One shot: a wrong password should say so once, not hammer the host
+        // three times (fail2ban counts those).
+        cmd += " -o NumberOfPasswordPrompts=1";
+    }
+    if (port > 0 && port != 22)
+        cmd += QString(" -p %1").arg(port);
+    if (!identity.isEmpty()) {
+        QString key = identity;
+        // Relative paths are written the way the user thinks of them
+        // ("data/.ssh/id_rsa"); ssh would resolve them against its own cwd.
+        if (QFileInfo(key).isRelative())
+            key = QDir::current().absoluteFilePath(key);
+        QFile kf(key);
+        if (kf.exists()) {
+            // ssh silently refuses keys anyone else can read.
+            kf.setPermissions(QFile::ReadOwner | QFile::WriteOwner);
+            cmd += " -i '" + key + "'";
+            // Otherwise the agent's keys are offered first and the server may
+            // drop the connection with "too many authentication failures" -
+            // which looks exactly like "the key I typed does nothing".
+            cmd += " -o IdentitiesOnly=yes";
+        } else {
+            qDebug() << "ssh: identity file not found:" << key;
+        }
+    }
+    if (!user.isEmpty())
+        cmd += " " + user + "@" + host;
+    else
+        cmd += " " + host;
+
+    if (_cmdPanel)
+        _cmdPanel->dismiss();
+
+    sendToShell(cmd.toUtf8());
+    sendToShell(QByteArray(1, '\r'));
+
+    _sshTail.clear();
+    _sshPwdTries = 0;
+
+    // Remembered so the dropped-connection banner can offer "重连" without
+    // the user retyping anything.
+    _lastSshCmd      = cmd;
+    _lastSshUser     = user;
+    _lastSshHost     = host;
+    _lastSshPort     = port;
+    _lastSshIdentity = identity;
+    _lastSshPassword = password;
+    _dcShown         = false;
+    _sshDiagShown    = false;
+    _sshTailForDiag.clear();
+    _dcTail.clear();
+    hideDisconnectBanner();
+    if (!password.isEmpty()) {
+        _sshPendingPwd = password;
+        if (!_sshPwdTimer) {
+            _sshPwdTimer = new QTimer(this);
+            _sshPwdTimer->setSingleShot(true);
+            connect(_sshPwdTimer, SIGNAL(timeout()),
+                    this, SLOT(clearPendingSshPassword()));
+        }
+        _sshPwdTimer->start(60000);
+    } else {
+        _sshPendingPwd.clear();
+    }
+    setFocus();
 }
 
 void TerminalDisplay::clearPendingSshPassword()
@@ -3016,6 +3857,10 @@ void TerminalDisplay::clearPendingSshPassword()
 	_sshTail.clear();
 	if (_sshPwdTimer)
 		_sshPwdTimer->stop();
+	// The askpass helper has a second reason to exist after this: leaving the
+	// plaintext password on the flash for the rest of the session is not worth
+	// a feature nobody is using any more.
+	QFile::remove(QDir::current().absoluteFilePath(QString("data/.ssh/askpass.pass")));
 }
 
 // ---------------------------------------------------------------------------
@@ -3113,6 +3958,19 @@ void TerminalDisplay::onDisconnectDismiss()
 	setFocus();
 }
 
+void TerminalDisplay::showSshDiagnostics()
+{
+	const QString log = QDir::current().absoluteFilePath(QString("data/ssh.log"));
+	if (!QFile::exists(log))
+		return;
+	// Typed at the prompt on purpose: the user is looking at that spot, and the
+	// lines stay in the scrollback where they can be read or copied.
+	sendToShell(QByteArray(1, '\r'));
+	sendToShell(QString("tail -n 30 '" + log + "'").toUtf8());
+	sendToShell(QByteArray(1, '\r'));
+	setFocus();
+}
+
 // ssh asks for the password on the tty, not through a helper process, so the
 // answer has to come from whoever owns the pty: this widget. The prompt can
 // arrive split over two reads, hence the small tail buffer.
@@ -3144,6 +4002,20 @@ void TerminalDisplay::onSessionOutput(const QString &text)
 	if (_sshPendingPwd.isEmpty())
 		return;
 
+	// Authentication ended in failure.  "Permission denied" on its own does not
+	// say whether the password was wrong, never sent, or drowned out by public
+	// keys, so pull the tail of the ssh -v log onto the screen.
+	if (!_sshDiagShown && !_lastSshCmd.isEmpty()) {
+		_sshTailForDiag += text.toLower();
+		if (_sshTailForDiag.size() > 256)
+			_sshTailForDiag = _sshTailForDiag.right(256);
+		if (_sshTailForDiag.contains(QString("permission denied"))) {
+			_sshDiagShown = true;
+			_sshTailForDiag.clear();
+			QTimer::singleShot(500, this, SLOT(showSshDiagnostics()));
+		}
+	}
+
 	_sshTail += text.toLower();
 	if (_sshTail.size() > 64)
 		_sshTail = _sshTail.right(64);
@@ -3154,14 +4026,28 @@ void TerminalDisplay::onSessionOutput(const QString &text)
 
 	QByteArray pwd = _sshPendingPwd.toUtf8();
 	pwd.append('\r');
-	td_write_bytes(pwd.constData(), pwd.size());
-	clearPendingSshPassword();
+	writeInputBytes(pwd.constData(), pwd.size());
+	// A wrong password just re-prompts; allow a couple of retries and
+	// only then forget it, otherwise the first typo disables the feature
+	// for the rest of the session.
+	_sshTail.clear();
+	if (++_sshPwdTries >= 3)
+		clearPendingSshPassword();
 }
 
 bool TerminalDisplay::handleImeKey(QKeyEvent* event)
 {
 	if (!_imeOn || !_ime)
 		return false;
+
+	// A commit empties the composition at once, but the echo of the
+	// character is still a pty round trip away. Keys that auto-repeat in
+	// that window (Space held down while picking a word, mostly) belong to
+	// the word that was just committed, not to the shell: letting them
+	// through is what produced the stray spaces and line breaks.
+	if (event->isAutoRepeat() && event->key() == Qt::Key_Space &&
+	    QDateTime::currentMSecsSinceEpoch() - _imeCommitMs < IME_COMMIT_GUARD_MS)
+		return true;
 
 	// Ctrl / Alt chords keep their meaning (Alt+Enter is the toggle itself),
 	// so they never reach the pinyin buffer.
@@ -3191,9 +4077,16 @@ bool TerminalDisplay::handleImeKey(QKeyEvent* event)
 	// Space takes the highlighted candidate (candidate 1 when nothing was
 	// steered to), the way a desktop input method does.
 	if (event->key() == Qt::Key_Space && cjk_ime_preedit(_ime)[0] != '\0') {
-		if (_imePanel)
+		// Take the highlighted candidate. If the strip has nothing laid out
+		// (or is closed) fall back to candidate 1 instead of swallowing the
+		// key - a dead Space makes people hit it again, which is exactly how
+		// junk ended up in the shell.
+		if (_imePanel && _imePanel->hasHighlight())
 			_imePanel->commitHighlighted();
+		else
+			sendImeSym('1');
 		_imeRaw.clear();
+		_imeCommitMs = QDateTime::currentMSecsSinceEpoch();
 		event->accept();
 		return true;
 	}
@@ -3208,15 +4101,30 @@ bool TerminalDisplay::handleImeKey(QKeyEvent* event)
 		QByteArray raw = _imeRaw.isEmpty()
 		                 ? QByteArray(cjk_ime_preedit(_ime))
 		                 : _imeRaw.toUtf8();
-		td_write_bytes(raw.constData(), raw.size());
+		imeTraceBytes("ime-enter-flush", raw.constData(), raw.size());
+		writeInputBytes(raw.constData(), raw.size());
 		cjk_ime_reset(_ime);
 		_imeRaw.clear();
+		_imeCommitMs = QDateTime::currentMSecsSinceEpoch();
 		refreshImePanel();
 		event->accept();
 		return true;
 	}
 
 	int sym = imeSymForEvent(event);
+
+	// With no composition running, only a letter may start one.  Everything
+	// else - Space, Backspace, Enter, digits, punctuation, Esc - belongs to the
+	// application.  The engine happily reports "consumed" for those (it reads
+	// them as "end of composition") while emitting no byte at all, so a TUI
+	// like Claude Code never receives the key and the screen just sits there,
+	// which reads as "nothing gets redrawn".  Ctrl chords never get here.
+	if (cjk_ime_preedit(_ime)[0] == '\0') {
+		const bool letter = (sym >= 'a' && sym <= 'z') ||
+		                    (sym >= 'A' && sym <= 'Z');
+		if (!letter)
+			return false;
+	}
 
 	// Keep the letters as typed (case included) for the Enter flush above;
 	// Backspace takes the last one back out so the flush always matches the
@@ -3244,10 +4152,12 @@ bool TerminalDisplay::handleImeKey(QKeyEvent* event)
 		if (cjk_ime_preedit(_ime)[0] != '\0') {
 			if (!_imeRaw.isEmpty()) {
 				const QByteArray raw = _imeRaw.toUtf8();
-				td_write_bytes(raw.constData(), raw.size());
+				imeTraceBytes("ime-flush", raw.constData(), raw.size());
+				writeInputBytes(raw.constData(), raw.size());
 			}
 			cjk_ime_reset(_ime);
 			_imeRaw.clear();
+			_imeCommitMs = QDateTime::currentMSecsSinceEpoch();
 			refreshImePanel();
 		}
 		return false;
@@ -3257,11 +4167,16 @@ bool TerminalDisplay::handleImeKey(QKeyEvent* event)
 	size_t outLen = 0;
 	const int r = cjk_ime_handle_key(_ime, sym, 0, 1, out, sizeof(out), &outLen);
 
-	if (r == 2 && outLen > 0)
-		td_write_bytes(out, (int)outLen);
+	if (r == 2 && outLen > 0) {
+		imeTraceBytes("ime-commit-key", out, (int)outLen);
+		writeInputBytes(out, (int)outLen);
+		_imeCommitMs = QDateTime::currentMSecsSinceEpoch();
+	}
 	if (cjk_ime_preedit(_ime)[0] == '\0')
 		_imeRaw.clear();        // committed, cancelled, or deleted back to empty
 	refreshImePanel();
+	if (r == 2)
+		update();               // repaint now instead of waiting for the echo
 
 	if (r == 0)
 		return false;           // engine did not use it: the shell gets the key
@@ -3287,18 +4202,16 @@ void TerminalDisplay::keyPressEvent( QKeyEvent* event )
 		return;
 	}
 
-	// Ctrl+Space, the usual desktop shortcut, does the same.
-	if (event->modifiers() == Qt::ControlModifier && event->key() == Qt::Key_Space) {
-		toggleImeMode();
-		event->accept();
-		return;
-	}
+	// Ctrl+Space is NOT a shortcut here any more: on a phone keyboard it is
+	// far too easy to hit by accident, and one stray chord used to leave the
+	// IME on for the whole session (letters swallowed as pinyin, shell looks
+	// dead). It now goes to the shell like every other Ctrl chord.
 
 	// Tab is missing from the BB10 layouts; it moved to Alt+Space now that
 	// Alt+Enter belongs to the input method.
 	if (event->modifiers() == Qt::AltModifier && event->key() == Qt::Key_Space) {
 		char tab = 0x09;
-		td_write_bytes(&tab, 1);
+		writeInputBytes(&tab, 1);
 		event->accept();
 		return;
 	}
@@ -3307,7 +4220,7 @@ void TerminalDisplay::keyPressEvent( QKeyEvent* event )
 	if (event->modifiers() == (Qt::ShiftModifier | Qt::AltModifier) &&
 	    event->key() >= 0x40 && event->key() <= 0x5f) {
 		char cc = (char)(event->key() - 0x40);
-		td_write_bytes(&cc, 1);
+		writeInputBytes(&cc, 1);
 		event->accept();
 		return;
 	}
@@ -3318,32 +4231,14 @@ void TerminalDisplay::keyPressEvent( QKeyEvent* event )
 	// exactly as it always did (uppercase, and the BB10 shift/SYM workaround
 	// below) - it is never allowed to turn into Ctrl.
 	//
-	// A double tap arms the sticky CTRL layer only when nothing else was typed
-	// between the two taps (_metaLastShiftMs is cleared by every other key
-	// press), so Shift+a Shift+b while typing capitals never arms it. When the
-	// platform reports no QNX keycode at all (nativeVirtualKey() and
-	// nativeScanCode() both 0) the two Shift keys are indistinguishable, so the
-	// double tap is then accepted from either of them.
+	// Right Shift is a plain modifier: down = Ctrl on, up = Ctrl off.  There
+	// is no double-tap latch, so tapping it twice in a row (or tapping it
+	// once by accident) sends nothing and changes nothing on screen.
 	if (event->key() == Qt::Key_Shift) {
 		const bool right = td_isRightShift(event);
-		const bool noKeycode = (event->nativeVirtualKey() == 0 &&
-		                        event->nativeScanCode() == 0);
 		_lastShiftNative   = event->nativeVirtualKey();
 		_lastShiftScan     = event->nativeScanCode();
 		_lastShiftWasRight = right;
-
-		if (!event->isAutoRepeat()) {
-			const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
-			const bool doubleTap = (_metaLastShiftMs != 0 &&
-			                        nowMs - _metaLastShiftMs <= META_DOUBLE_TAP_MS);
-			_metaLastShiftMs = doubleTap ? 0 : nowMs;
-			if (doubleTap && (right || noKeycode)) {
-				_ctrlHeld = false;
-				setMetaLayer(!_metaArmed);   // double-tap toggles the layer
-				event->accept();
-				return;
-			}
-		}
 
 		if (right) {
 			_ctrlHeld = true;   // hold right Shift = hold Ctrl, nothing is sent
@@ -3352,36 +4247,9 @@ void TerminalDisplay::keyPressEvent( QKeyEvent* event )
 		}
 	}
 
-	// Any other key cancels a pending double tap, so Shift-letter-Shift-letter
-	// while typing capitals never looks like a double tap.
-	if (event->key() != Qt::Key_Shift)
-		_metaLastShiftMs = 0;
-	if (event->key() != Qt::Key_Right)
-		_metaLastRightMs = 0;
-
-	// Term50 metamode entry, also retargeted to the physical Right arrow
-	// (external/USB keyboards only - BB10 phones have no arrow keys):
-	// double-tap arms the CTRL layer; a single tap falls through and is sent
-	// as cursor-right by the emulation below.
-	if (event->key() == Qt::Key_Right && !event->isAutoRepeat()) {
-		qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
-		if (_metaLastRightMs != 0 && nowMs - _metaLastRightMs <= META_DOUBLE_TAP_MS) {
-			_metaLastRightMs = 0;
-			setMetaLayer(!_metaArmed);   // double-tap toggles the layer
-			event->accept();
-			return;
-		}
-		_metaLastRightMs = nowMs;
-	}
-
-	if (_metaArmed) {
-		handleMetaKey(event);
-		return;
-	}
-
 	// right Shift is still held: this key is Ctrl+<key>
 	if (_ctrlHeld) {
-		td_send_ctrl_key(event);
+		sendCtrlKey(event);
 		event->accept();
 		return;
 	}
@@ -3390,8 +4258,13 @@ void TerminalDisplay::keyPressEvent( QKeyEvent* event )
 	// While it is on, a-z build the pinyin buffer while 1-9, 0 and < > work
 	// the candidate strip. Ctrl/Alt chords, the sticky CTRL layer and the
 	// SYM grid were handled above and keep priority.
-	if (_imeOn && handleImeKey(event))
-		return;
+	if (_imeOn) {
+		const int preNow = _ime ? (int)cjk_ime_preedit(_ime)[0] : 0;
+		const bool imeUsed = handleImeKey(event);
+		imeTraceKey(imeUsed ? "ime-used" : "ime-pass", event, preNow);
+		if (imeUsed)
+			return;
+	}
 
 	// --- SYM key: the Term50 symmenu overlay ---------------------------
 	// The physical SYM key is QNX keycode 0xF0d3 (Term50 KEYCODE_BB_SYM_KEY);
@@ -3466,7 +4339,7 @@ void TerminalDisplay::keyPressEvent( QKeyEvent* event )
 		case 0x30 : c = '0'; break;
 		}
 		if (c != 0)
-			write(masterFdG, &c, 1);
+			writeInputBytes(&c, 1);
 		return;
 	}
 
@@ -3477,18 +4350,18 @@ void TerminalDisplay::keyPressEvent( QKeyEvent* event )
 		char c = 0x0;
 		if (event->key() < 0x60 && event->key() > 0x40){
 			c = event->key() - 0x40;
-			write(masterFdG, &c, 1);
+			writeInputBytes(&c, 1);
 		}
 		return;
 	}
 	if (event->key() == Qt::Key_Tab){
 		char c = 9;
-		write(masterFdG, &c, 1);
+		writeInputBytes(&c, 1);
 		return;
 	}
 	if (event->key() == Qt::Key_Escape){
 		char c = 0x1B;
-		write(masterFdG, &c, 1);
+		writeInputBytes(&c, 1);
 		return;
 	}
     bool emitKeyPressSignal = true;
@@ -3505,6 +4378,20 @@ void TerminalDisplay::keyPressEvent( QKeyEvent* event )
 				emit flowControlKeyPressed(false /*output enabled*/);
 		}
 	}
+
+    // Shift+PageUp/PageDown on the alternate screen: the local history is
+    // empty, so forward the keys the pager actually listens for instead of
+    // scrolling a zero-range bar.
+    if ( event->modifiers() == Qt::ShiftModifier && _screenWindow &&
+         _screenWindow->screen() && _screenWindow->screen()->isAlternateScreen() &&
+         ( event->key() == Qt::Key_PageUp || event->key() == Qt::Key_PageDown ) )
+    {
+        const char pgup[4]   = { 0x1b, '[', '5', '~' };
+        const char pgdown[4] = { 0x1b, '[', '6', '~' };
+        writeInputBytes(event->key() == Qt::Key_PageUp ? pgup : pgdown, 4);
+        event->accept();
+        return;
+    }
 
     // Keyboard-based navigation
     if ( event->modifiers() == Qt::ShiftModifier )
@@ -3563,11 +4450,18 @@ void TerminalDisplay::keyPressEvent( QKeyEvent* event )
     }
 
     if ( emitKeyPressSignal )
+    {
         if (bShiftFlag && dtDevice == BB_PASSPORT){
-            QKeyEvent* event_caps = new QKeyEvent(QEvent::KeyPress, event->key(), event->modifiers(), event->text().toUpper());
-            emit keyPressedSignal(event_caps);
-        }else
+            // Stack object: the old code heap-allocated the key event and
+            // nobody ever deleted it, so every capital letter typed on a
+            // Passport leaked one QKeyEvent.
+            QKeyEvent event_caps(QEvent::KeyPress, event->key(),
+                                 event->modifiers(), event->text().toUpper());
+            emit keyPressedSignal(&event_caps);
+        }else{
             emit keyPressedSignal(event);
+        }
+    }
 
     event->accept();
 }
@@ -3600,11 +4494,22 @@ QVariant TerminalDisplay::inputMethodQuery( Qt::InputMethodQuery query ) const
         case Qt::ImSurroundingText:
             {
                 // return the text from the current line
+                // A cursor sitting on the last row, or a line whose
+                // properties have not been filled in yet, used to index
+                // _lineProperties[] out of bounds - the IME query is called by
+                // the framework at arbitrary moments, so this has to be
+                // guarded rather than assumed.
+                const int cy = cursorPos.y();
+                if (!_image || cy < 0 || cy >= _usedLines)
+                    return QString();
+
                 QString lineText;
                 QTextStream stream(&lineText);
                 PlainTextDecoder decoder;
                 decoder.begin(&stream);
-                decoder.decodeLine(&_image[loc(0,cursorPos.y())],_usedColumns,_lineProperties[cursorPos.y()]);
+                const quint8 props = (cy < _lineProperties.size())
+                                     ? _lineProperties.at(cy) : 0;
+                decoder.decodeLine(&_image[loc(0,cy)],_usedColumns,props);
                 decoder.end();
                 return lineText;
             }
@@ -3743,7 +4648,10 @@ void TerminalDisplay::calcGeometry()
   }
 
   _topMargin = DEFAULT_TOP_MARGIN;
-  _contentHeight = contentsRect().height() - 2 * DEFAULT_TOP_MARGIN + /* mysterious */ 1;
+  _contentHeight = contentsRect().height() - 2 * DEFAULT_TOP_MARGIN + /* mysterious */ 1
+                   - _bottomReserve - DEFAULT_BOTTOM_PAD;
+  if (_contentHeight < _fontHeight)
+     _contentHeight = _fontHeight;   // never collapse below a single row
 
   if (!_isFixedSize)
   {
@@ -3772,6 +4680,13 @@ void TerminalDisplay::makeImage()
   // We over-commit one character so that we can be more relaxed in dealing with
   // certain boundary conditions: _image[_imageSize] is a valid but unused position
   _image = new Character[_imageSize+1];
+
+  // Same size as _image: the reference copy that paintEvent() compares row by
+  // row to decide what actually has to be repainted.
+  delete[] _snapshot;
+  _snapshot = new Character[_imageSize+1];
+  memset(_snapshot, 0, (_imageSize+1) * sizeof(Character));
+  _snapshotValid = false;
 
   clearImage();
 }
@@ -3807,6 +4722,7 @@ void TerminalDisplay::setFixedSize(int cols, int lins)
   if (_image)
   {
      delete[] _image;
+  delete[] _snapshot;
      makeImage();
   }
   setSize(cols, lins);
@@ -3882,46 +4798,39 @@ void TerminalDisplay::doDrag()
 
 void TerminalDisplay::outputSuspended(bool suspended)
 {
-	//create the label when this function is first called
+	// The stock Konsole label ("Output has been suspended by pressing Ctrl+S")
+	// was added to the grid layout, which pins it to cell (0,0) - i.e. exactly
+	// on top of the first row of output - and it filled with the Base palette
+	// role, a light rectangle on a dark terminal.  Keep the warning (a silent
+	// stop is worse than a visible one) but float it as a themed strip under
+	// the top edge instead of nailing it to the corner.
 	if (!_outputSuspendedLabel)
 	{
-            //This label includes a link to an English language website
-            //describing the 'flow control' (Xon/Xoff) feature found in almost 
-            //all terminal emulators.
-            //If there isn't a suitable article available in the target language the link
-            //can simply be removed.
-			_outputSuspendedLabel = new QLabel( ("<qt>Output has been "
-                                                "<a href=\"http://en.wikipedia.org/wiki/XON\">suspended</a>"
-                                                " by pressing Ctrl+S."
-											   "  Press <b>Ctrl+Q</b> to resume.</qt>"),
-											   this );
-
-            QPalette palette(_outputSuspendedLabel->palette());
-	    
-	    palette.setColor(QPalette::Normal, QPalette::WindowText, QColor(Qt::white));
-	    palette.setColor(QPalette::Normal, QPalette::Window, QColor(Qt::black));
-//            KColorScheme::adjustForeground(palette,KColorScheme::NeutralText);
-//		KColorScheme::adjustBackground(palette,KColorScheme::NeutralBackground);
-    	    _outputSuspendedLabel->setPalette(palette);
-	    _outputSuspendedLabel->setAutoFillBackground(true);
-	    _outputSuspendedLabel->setBackgroundRole(QPalette::Base);
-	    _outputSuspendedLabel->setFont(QApplication::font());
-            _outputSuspendedLabel->setMargin(5);
-
-            //enable activation of "Xon/Xoff" link in label
-            _outputSuspendedLabel->setTextInteractionFlags(Qt::LinksAccessibleByMouse | 
-                                                          Qt::LinksAccessibleByKeyboard);
-            _outputSuspendedLabel->setOpenExternalLinks(true);
-            _outputSuspendedLabel->setVisible(false);
-
-            _gridLayout->addWidget(_outputSuspendedLabel);       
-            _gridLayout->addItem( new QSpacerItem(0,0,QSizePolicy::Expanding,
-                                                      QSizePolicy::Expanding),
-                                 1,0);
-
-    }
+		_outputSuspendedLabel = new QLabel(this);
+		_outputSuspendedLabel->setText(QString::fromUtf8(
+		    "输出已暂停 · 按 Ctrl+Q 继续"));
+		_outputSuspendedLabel->setAlignment(Qt::AlignCenter);
+		_outputSuspendedLabel->setMargin(8);
+		_outputSuspendedLabel->setFont(UiTheme::uiFont(15));
+		_outputSuspendedLabel->setStyleSheet(QString(
+		    "QLabel { background: %1; color: %2; border: 1px solid %3;"
+		    " border-radius: 8px; padding: 0 12px; }")
+		    .arg(UiTheme::hex(UiTheme::Surface),
+		         UiTheme::hex(UiTheme::Text),
+		         UiTheme::hex(UiTheme::Border)));
+		_outputSuspendedLabel->setAttribute(Qt::WA_TransparentForMouseEvents, true);
+		_outputSuspendedLabel->setVisible(false);
+	}
 
 	_outputSuspendedLabel->setVisible(suspended);
+
+	if (suspended) {
+		_outputSuspendedLabel->adjustSize();
+		// centred, 8px below the top edge: it may cover a character or two,
+		// but it no longer owns the corner on every repaint
+		_outputSuspendedLabel->move((width() - _outputSuspendedLabel->width()) / 2, 8);
+		_outputSuspendedLabel->raise();
+	}
 }
 
 uint TerminalDisplay::lineSpacing() const
@@ -3950,6 +4859,17 @@ void TerminalDisplay::keyReleaseEvent( QKeyEvent* event )
 			_ctrlHeld = false;
 	}
 	QWidget::keyReleaseEvent(event);
+}
+
+// The Ctrl lent by the right Shift must not outlive the keyboard focus.  If the
+// matching release is swallowed - a dialog opens on top, the app is switched
+// away, the platform drops the key-up - _ctrlHeld would stay true and every
+// later keystroke would silently turn into Ctrl+<key>, which looks exactly
+// like a stuck terminal.
+void TerminalDisplay::focusOutEvent(QFocusEvent* event)
+{
+	_ctrlHeld = false;
+	QWidget::focusOutEvent(event);
 }
 
 /* ------------------------------------------------------------------------- */
@@ -3991,6 +4911,8 @@ void TerminalDisplay::touchEvent(QTouchEvent *ev)
 		// Two fingers: pinch to change the font size, or a straight
 		// up/down drag to walk through the scrollback.
 		_tsLongTimer->stop();
+		_tsTouching = true;
+		_tsLastTapMs = 0;
 		_tsMode = 2;
 
 		qreal d = QLineF(p0, p1).length();
@@ -4033,7 +4955,8 @@ void TerminalDisplay::touchEvent(QTouchEvent *ev)
 			int lines = (int)(_tsScrollAcc / step);
 			if (lines != 0) {
 				_tsScrollAcc -= lines * step;
-				_scrollBar->setValue(_scrollBar->value() + lines);
+				if (!scrollAlternateScreen(lines))
+					_scrollBar->setValue(_scrollBar->value() + lines);
 			}
 		}
 
@@ -4047,24 +4970,50 @@ void TerminalDisplay::touchEvent(QTouchEvent *ev)
 			_tsMode = 1;
 			_tsMoved = false;
 			_tsLongFired = false;
+			_tsLongStage = 0;
+			_tsMenuShown = false;
+			_tsScrolling = false;
+			_tsTouching = true;
 			_tsTwoMode = 0;
 			_tsPinchBase = 0;
+			_tsScrollAcc = 0;
 			_tsStart = p0.toPoint();
-			_tsLongTimer->start(450);
+			_tsDragLastY = p0.y();
+			// 700 ms, not 450: a finger that rests for a moment before
+			// dragging must still scroll instead of lighting up a line.
+			_tsLongTimer->start(kHoldLineMs);
 			ev->accept();
 			return;
 		}
 
 		if (ev->type() == QEvent::TouchUpdate) {
 			QPoint now = p0.toPoint();
-			if (!_tsMoved && (now - _tsStart).manhattanLength() > 16) {
+			if (!_tsMoved && (now - _tsStart).manhattanLength() > 12) {
 				_tsMoved = true;
 				_tsLongTimer->stop();
+				if (!_tsLongFired) {
+					// Plain one-finger drag: walk through the scrollback.
+					// Decided here, once, so the rest of the drag cannot
+					// turn into a selection halfway down the screen.
+					_tsScrolling = true;
+					_tsScrollAcc = 0;
+					_tsDragLastY = _tsStart.y();
+					if (_screenWindow) {
+						_screenWindow->clearSelection();
+						_actSel = 0;
+					}
+					update();
+				}
 			}
-			// Dragging after the long press grows the selection instead of
-			// scrolling, which is the usual "select some text" gesture.
-			if (_tsLongFired && _tsMoved)
+
+			if (_tsLongFired && _tsMoved) {
+				// Dragging after the long press grows the selection instead
+				// of scrolling, which is the usual "select some text" gesture.
 				extendTouchSelection(now);
+			}
+			// No single-finger scrolling here: on BB10 the finger moves
+			// arrive as mouse events and are scrolled by mouseMoveEvent().
+			// Handling them twice would scroll at double speed.
 			ev->accept();
 			return;
 		}
@@ -4076,13 +5025,29 @@ void TerminalDisplay::touchEvent(QTouchEvent *ev)
 	// Everything lifted.
 	if (ev->type() == QEvent::TouchEnd) {
 		_tsLongTimer->stop();
-		if (_tsMode == 1 && !_tsMoved && !_tsLongFired)
-			setFocus();          // a plain tap just brings the keyboard focus back
+		_tsTouching = false;
+		if (_tsMode == 1 && !_tsMoved && !_tsLongFired && ev->type() == QEvent::TouchEnd) {
+			// A tap: the first one only focuses, the second one selects the
+			// word under it. 400 ms and a generous slop, roughly what the
+			// platform itself uses for a double tap.
+			qint64 ms = QDateTime::currentMSecsSinceEpoch();
+			bool pair = (_tsLastTapMs > 0) && (ms - _tsLastTapMs <= 400)
+			            && ((_tsStart - _tsLastTapPos).manhattanLength() <= 48);
+			if (pair) {
+				_tsLastTapMs = 0;
+				selectWordAt(_tsStart);
+			}
+			else {
+				_tsLastTapMs = ms;
+				_tsLastTapPos = _tsStart;
+				setFocus();      // a plain tap just brings the keyboard focus back
+			}
+		}
 
 		// The menu opens when the finger goes up, not while it is still
 		// down: a menu popped under a pressed finger would take that
 		// release as a click on its first entry.
-		if (_tsMode == 1 && _tsLongFired) {
+		if (_tsMode == 1 && _tsLongFired && !_tsMenuShown) {
 			QPoint at = _tsStart;
 			_tsMoved = false;
 			_tsLongFired = false;
@@ -4092,6 +5057,10 @@ void TerminalDisplay::touchEvent(QTouchEvent *ev)
 		_tsMode = 0;
 		_tsTwoMode = 0;
 		_tsPinchBase = 0;
+		_tsScrolling = false;
+
+		ev->accept();
+		return;
 	}
 
 	ev->ignore();
@@ -4099,15 +5068,40 @@ void TerminalDisplay::touchEvent(QTouchEvent *ev)
 
 void TerminalDisplay::onTouchLongPress()
 {
-	if (!_screenWindow || _tsMoved)
+	// Two stages, so the finger never has to guess how long to stay down.
+	// First the line under it lights up - that is the acknowledgement that
+	// the press has been taken. kHoldMenuMs later the menu opens by itself,
+	// without waiting for the finger to lift.
+	if (!_screenWindow || _tsMoved || _tsScrolling)
 		return;
 
-	int absLine = -1;
-	selectLineAt(_tsStart, &absLine);
-	if (absLine < 0)
+	int line = 0, column = 0;
+	getCharacterPosition(_tsStart, line, column);
+	if (line < 0 || line >= _lines)
 		return;
 
-	_tsLongFired = true;
+	if (_tsLongStage == 0) {
+		_tsLongStage = 1;
+		_tsLongFired = true;
+		int absLine = -1;
+		selectLineAt(_tsStart, &absLine);
+		update();
+		if (_tsLongTimer)
+			_tsLongTimer->start(kHoldMenuMs);
+		return;
+	}
+
+	// Stage two: open the menu now. It is placed a finger-height away so
+	// the release that follows cannot land on its first entry.
+	_tsLongStage = 2;
+	_tsMenuShown = true;
+	QPoint at = _tsStart;
+	int dy = (_fontHeight > 4) ? _fontHeight * 3 : 48;
+	at.setY(at.y() - dy);
+	if (at.y() < 8)
+		at.setY(_tsStart.y() + dy);
+	tsTrace("hold-menu", at.y(), 0);
+	showTouchMenu(at);
 	update();
 }
 
@@ -4122,9 +5116,10 @@ void TerminalDisplay::selectLineAt(const QPoint& pos, int* absLine)
 	if (line < 0 || line >= _lines)
 		return;
 
-	int abs = line + _scrollBar->value();
+	int abs = line;
 	_screenWindow->setSelectionStart(0, abs, false);
 	_screenWindow->setSelectionEnd(_columns - 1, abs);
+	_actSel = 2;   // draw the highlight: this is the "hold taken" feedback
 	*absLine = abs;
 }
 
@@ -4140,7 +5135,79 @@ void TerminalDisplay::extendTouchSelection(const QPoint& pos)
 	if (column < 0) column = 0;
 	if (column >= _columns) column = _columns - 1;
 
-	_screenWindow->setSelectionEnd(column, line + _scrollBar->value());
+	int sLine = 0, sColumn = 0;
+	getCharacterPosition(_tsStart, sLine, sColumn);
+	if (sLine < 0) sLine = 0;
+	if (sLine >= _lines) sLine = _lines - 1;
+	if (sColumn < 0) sColumn = 0;
+	if (sColumn >= _columns) sColumn = _columns - 1;
+
+	// setSelectionStart/End take window-relative lines and add the current
+	// scroll position themselves, so no _scrollBar->value() here.
+	_screenWindow->setSelectionStart(sColumn, sLine, false);
+	_screenWindow->setSelectionEnd(column, line);
+	_actSel = 2;
+	update();
+}
+
+// Selects the word under widgetPoint. Shared by the double-click handler and
+// the double-tap gesture: the platform does not always turn two quick taps
+// into a real double click event, so the gesture side needs its own entry.
+void TerminalDisplay::selectWordAt(const QPoint& widgetPoint)
+{
+	if (!_screenWindow || !_image)
+		return;
+
+	int charLine = 0, charColumn = 0;
+	getCharacterPosition(widgetPoint, charLine, charColumn);
+
+	QPoint bgnSel(charColumn, charLine);
+	QPoint endSel = bgnSel;
+	int i = loc(bgnSel.x(), bgnSel.y());
+	if (i < 0 || i >= _lines * _columns)
+		return;
+
+	_screenWindow->clearSelection();
+	_iPntSel = bgnSel;
+	_iPntSel.ry() += _scrollBar->value();
+	_wordSelectionMode = true;
+
+	int selClass = charClass(_image[i].character);
+
+	// walk to the start of the word
+	int x = bgnSel.x();
+	while (i > 0
+	       && ((x > 0) || (bgnSel.y() > 0 && (_lineProperties[bgnSel.y() - 1] & LINE_WRAPPED)))
+	       && charClass(_image[i - 1].character) == selClass) {
+		i--;
+		if (x > 0) x--;
+		else { x = _usedColumns - 1; bgnSel.ry()--; }
+	}
+
+	bgnSel.setX(x);
+	_screenWindow->setSelectionStart(bgnSel.x(), bgnSel.y(), false);
+
+	// and from there to the end
+	i = loc(endSel.x(), endSel.y());
+	x = endSel.x();
+	while (i + 1 < _lines * _columns
+	       && ((x < _usedColumns - 1) || (endSel.y() < _usedLines - 1 && (_lineProperties[endSel.y()] & LINE_WRAPPED)))
+	       && charClass(_image[i + 1].character) == selClass) {
+		i++;
+		if (x < _usedColumns - 1) x++;
+		else { x = 0; endSel.ry()++; }
+	}
+
+	endSel.setX(x);
+
+	// in word mode do not swallow the @ that ends an address
+	if (QChar(_image[i].character) == QLatin1Char('@') && (endSel.x() - bgnSel.x()) > 0)
+		endSel.setX(x - 1);
+
+	_actSel = 2; // inside a selection
+
+	_screenWindow->setSelectionEnd(endSel.x(), endSel.y());
+	setSelection(_screenWindow->selectedText(_preserveLineBreaks));
 	update();
 }
 
@@ -4164,12 +5231,8 @@ void TerminalDisplay::showTouchMenu(const QPoint& pos)
 	}
 	if (chosen == aCopyText  ) { copySelectionToClipboard(); return; }
 	if (chosen == aCopyScreen) {
-		int top = _scrollBar->value();
-		int bottom = top + _lines - 1;
-		int maxBottom = _scrollBar->maximum() + _lines - 1;
-		if (bottom > maxBottom) bottom = maxBottom;
-		_screenWindow->setSelectionStart(0, top, false);
-		_screenWindow->setSelectionEnd(_columns - 1, bottom);
+		_screenWindow->setSelectionStart(0, 0, false);
+		_screenWindow->setSelectionEnd(_columns - 1, _lines - 1);
 		copySelectionToClipboard();
 		return;
 	}

@@ -28,6 +28,8 @@
 // System
 #include <sys/types.h>
 #include <sys/stat.h>
+#include <sys/ioctl.h>
+#include <poll.h>
 #include <unistd.h>
 #include <errno.h>
 #include <termios.h>
@@ -234,7 +236,8 @@ void Pty::setWriteable(bool writeable)
 }
 
 Pty::Pty()
-    : _bufferFull(false),
+    : _writeFd(-1),
+      _bufferFull(false),
       _windowColumns(0),
       _windowLines(0),
       _eraseChar(0),
@@ -257,9 +260,19 @@ Pty::~Pty()
     delete _pty;
 }
 
+// The pty of every tab is owned by CShellSession (cshell.cpp); the Konsole
+// process object is never started, so its stdin fd stays -1.  writeStdin()
+// therefore failed on every single key press and the queue was never drained:
+// typing into a tab did nothing at all, and the tab looked dead.  The queue now
+// leaves through the pty of the tab that has the focus (gActiveFd) and is
+// drained synchronously - on this device a pty takes a few bytes at a time, so
+// there is nothing to be won from the old async dance.
+extern int gActiveFd;
+
 void Pty::writeReady()
 {
-  _pendingSendJobs.erase(_pendingSendJobs.begin());
+  if (!_pendingSendJobs.isEmpty())
+    _pendingSendJobs.erase(_pendingSendJobs.begin());
   _bufferFull = false;
   doSendJobs();
 }
@@ -270,16 +283,64 @@ void Pty::doSendJobs() {
      emit bufferEmpty(); 
      return;
   }
-  
-  SendJob& job = _pendingSendJobs.first();
 
-  
-  if (!writeStdin( job.data(), job.length() ))
-  {
-    qWarning("Pty::doSendJobs - Could not send input data to terminal process.");
-    return;
+  // Write the whole job, waiting out EAGAIN instead of dropping the tail.
+  // The master fd is O_NONBLOCK, so pasting a screenful of text (or a fast
+  // typist in front of a slow reader) used to be cut off in the middle: the
+  // shell got half a command and the rest vanished without a word.  A short
+  // poll() is enough - the reader drains the buffer within a frame or two.
+  // This tab's own pty when one was attached; the global active-tab hook
+  // only remains for the legacy single-session paths.
+  const int outFd = (_writeFd >= 0) ? _writeFd : gActiveFd;
+
+  while (!_pendingSendJobs.isEmpty()) {
+    SendJob& job = _pendingSendJobs.first();
+
+    bool ok = false;
+    if (outFd >= 0) {
+      const char *p = job.data();
+      int left = job.length();
+      ok = true;
+      int stalled = 0;              // ms waited for room in the pty buffer
+      while (left > 0) {
+        const ssize_t n = ::write(outFd, p, left);
+        if (n > 0) {
+          p += n;
+          left -= (int)n;
+          stalled = 0;
+          continue;
+        }
+        if (n < 0 && errno == EINTR)
+          continue;
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+          if (stalled >= 250) {   // no room for a quarter second: give up
+            ok = false;
+            break;
+          }
+          struct pollfd pfd;
+          pfd.fd = outFd;
+          pfd.events = POLLOUT;
+          pfd.revents = 0;
+          ::poll(&pfd, 1, 20);
+          stalled += 20;
+          continue;
+        }
+        ok = false;
+        break;
+      }
+    } else {
+      ok = writeStdin(job.data(), job.length());
+    }
+
+    // Never keep a failed job at the head of the queue: one dead fd would
+    // otherwise swallow every key that follows it, for good.
+    _pendingSendJobs.erase(_pendingSendJobs.begin());
+
+    if (!ok)
+      qWarning("Pty::doSendJobs - input dropped, no live pty for the active tab.");
   }
-  _bufferFull = true;
+
+  emit bufferEmpty();
 }
 
 void Pty::appendSendJob(const char* s, int len)

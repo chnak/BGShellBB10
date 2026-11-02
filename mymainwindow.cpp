@@ -7,6 +7,8 @@
 #include <QtCore/QFile>
 #include <QtGui/QMessageBox>
 #include <QtGui/QPalette>
+#include <QtGui/QTouchEvent>
+#include <QtGui/QMouseEvent>
 #include <QtGui/QColor>
 #include <QtCore/QDir>
 #include <bps/netstatus.h>
@@ -16,15 +18,30 @@
 #include "mymainwindow.h"
 #include "mysystemmenu.h"
 #include "mysettingswindow.h"
+#include "qtermwidget.h"
+#include "csessiontabs.h"
+#include "cshell.h"
 
 extern CMySystemMenu *SystemMenu;
 extern CMyMainWindow *mainWindow;
+extern QTermWidget *console;
+extern CSessionTabs *sessionTabs;
+extern int gActiveFd;
+extern QFont font;
+QTermWidget *bgshellCreateSession();
+void bgshellCloseSession(int index);
+// A tab whose shell ended by itself needs a different prompt from one the user
+// closed on purpose.
+void bgshellSessionEnded(int index);
 #define SSH_CONFIG_FNAME "data/.ssh/config"
 #define SSH_CONFIG_FNAME_TMP "data/.ssh/config.tmp"
 #define SSH_PROXY_AUTH_FNAME "data/.ssh/myauth"
 
 CMyMainWindow::CMyMainWindow() :
-	QMainWindow()
+	QMainWindow(),
+	_menuDownY(0),
+	_menuTracking(false),
+	_menuSwallow(false)
 {
 	// Behind the terminal (e.g. while the keyboard resizes it) never show
 	// the default grey: paint the same backdrop the terminal uses.
@@ -39,6 +56,9 @@ CMyMainWindow::CMyMainWindow() :
 		nFontSize = nConfigFontSize;
 	else
 		nFontSize = 22;
+	// Watch touches ourselves: the framework only reports the swipe-DOWN
+	// edge gesture (PlatformPanel), never the swipe back up.
+	qApp->installEventFilter(this);
 	ReadAndApplyProxySettings();
 }
 
@@ -63,10 +83,123 @@ bool CMyMainWindow::event(QEvent *e){
 		if (SystemMenu->isVisible()){
 			SystemMenu->hide();
 		}else{
+			SystemMenu->raise();     // the tab strip is its sibling: stay on top
 			SystemMenu->show();
 		}
 	}
 	return QMainWindow::event(e);
+}
+
+// The framework only reports "the user swiped down" (QEvent::PlatformPanel).
+// A card that opens but cannot be swiped away feels broken, so while it is up:
+//   swipe up   -> close it
+//   tap below  -> close it and swallow the tap, so nothing gets typed
+bool CMyMainWindow::eventFilter(QObject *watched, QEvent *event)
+{
+	// Cheap guard: the filter is installed application-wide, so ignore every
+	// event that cannot move or dismiss the card.
+	switch (event->type()){
+	case QEvent::TouchBegin:
+	case QEvent::TouchUpdate:
+	case QEvent::TouchEnd:
+	case QEvent::MouseButtonPress:
+	case QEvent::MouseMove:
+	case QEvent::MouseButtonRelease:
+		break;
+	default:
+		return QMainWindow::eventFilter(watched, event);
+	}
+
+	// Finish eating a gesture that already dismissed the card; otherwise the
+	// terminal would be left holding a half-finished press.
+	if (_menuSwallow){
+		switch (event->type()){
+		case QEvent::TouchEnd:
+			case QEvent::MouseButtonRelease:
+			_menuSwallow = false;
+			break;
+		default:
+			break;
+		}
+		return true;
+	}
+
+	if (SystemMenu && SystemMenu->isVisible()){
+		// The card no longer spans the screen, so "outside" means outside the
+		// card rectangle - otherwise a tap to its left would fall through to
+		// the terminal and be typed.
+		const QRect cardRect(SystemMenu->mapToGlobal(QPoint(0, 0)),
+		                     SystemMenu->size());
+
+		switch (event->type()){
+		case QEvent::TouchBegin: {
+			QTouchEvent *pTouch = static_cast<QTouchEvent *>(event);
+			if (!pTouch->touchPoints().isEmpty()){
+				const QPointF sp = pTouch->touchPoints().at(0).screenPos();
+				_menuDownY = (int)sp.y();
+				_menuTracking = true;
+				if (!cardRect.contains(QPoint((int)sp.x(), (int)sp.y()))){
+					// Finger landed outside the card.
+					SystemMenu->hide();
+					if (console)
+						console->setFocus();
+					_menuTracking = false;
+					_menuSwallow = true;
+					return true;
+				}
+			}
+			break;
+		}
+		case QEvent::TouchUpdate: {
+			QTouchEvent *pTouch = static_cast<QTouchEvent *>(event);
+			if (_menuTracking && !pTouch->touchPoints().isEmpty()){
+				const int nY = (int)pTouch->touchPoints().at(0).screenPos().y();
+				if (_menuDownY - nY > 60){        // finger travelled upwards
+					SystemMenu->hide();
+					if (console)
+						console->setFocus();
+					_menuTracking = false;
+				}
+			}
+			break;
+		}
+		case QEvent::TouchEnd:
+				_menuTracking = false;
+			break;
+		case QEvent::MouseButtonPress: {
+			// Same for a mouse (host build / simulator) -- and a fallback for
+			// platforms that turn touches into mouse events.
+			QMouseEvent *pMouse = static_cast<QMouseEvent *>(event);
+			if (!cardRect.contains(pMouse->globalPos())){
+				SystemMenu->hide();
+				if (console)
+					console->setFocus();
+				_menuSwallow = true;
+				return true;
+			}
+			_menuDownY = (int)pMouse->globalY();
+			_menuTracking = true;
+			break;
+		}
+		case QEvent::MouseMove: {
+			QMouseEvent *pMouse = static_cast<QMouseEvent *>(event);
+			if (_menuTracking && (_menuDownY - (int)pMouse->globalY()) > 60){
+				SystemMenu->hide();
+				if (console)
+					console->setFocus();
+				_menuTracking = false;
+			}
+			break;
+		}
+		case QEvent::MouseButtonRelease:
+			_menuTracking = false;
+			break;
+		default:
+			break;
+		}
+	}
+
+	return QMainWindow::eventFilter(watched, event);
 }
 
 void CMyMainWindow::ReadAndApplyProxySettings(){
@@ -225,4 +358,78 @@ void CMyMainWindow::ReadAndApplyProxySettings(){
 
 		}
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Multi-session plumbing
+//
+// "console" is kept as the one global pointer every other file already uses;
+// switching tabs simply repoints it (and the pty the key handlers write to).
+// ---------------------------------------------------------------------------
+void CMyMainWindow::sessionCurrentChanged(int index)
+{
+    Q_UNUSED(index);
+    if (!sessionTabs)
+        return;
+
+    QTermWidget *term = qobject_cast<QTermWidget *>(sessionTabs->currentPage());
+    if (!term)
+        return;
+
+    console   = term;
+    gActiveFd = term->shell() ? term->shell()->fd() : -1;
+
+    // The font setting may have changed while another tab was visible.
+    term->setTerminalFont(::font);
+    term->setFocus();
+}
+
+void CMyMainWindow::sessionNew()
+{
+    bgshellCreateSession();
+}
+
+void CMyMainWindow::sessionClose(int index)
+{
+    bgshellCloseSession(index);
+}
+
+void CMyMainWindow::sessionMenu()
+{
+    if (!SystemMenu)
+        return;
+    if (SystemMenu->isVisible()) {
+        SystemMenu->hide();
+    } else {
+        SystemMenu->raise();     // the tab strip is its sibling: stay on top
+        SystemMenu->show();
+    }
+}
+
+void CMyMainWindow::sessionTitleChanged(const QString &title)
+{
+    QTermWidget *term = qobject_cast<QTermWidget *>(sender());
+    if (!term || !sessionTabs || title.isEmpty())
+        return;
+
+    for (int i = 0; i < sessionTabs->count(); ++i) {
+        if (sessionTabs->pageAt(i) == term) {
+            sessionTabs->setPageTitle(i, title);
+            return;
+        }
+    }
+}
+
+void CMyMainWindow::sessionFinished()
+{
+    QTermWidget *term = qobject_cast<QTermWidget *>(sender());
+    if (!term || !sessionTabs)
+        return;
+
+    for (int i = 0; i < sessionTabs->count(); ++i) {
+        if (sessionTabs->pageAt(i) == term) {
+            bgshellSessionEnded(i);
+            return;
+        }
+    }
 }

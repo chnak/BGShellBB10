@@ -745,6 +745,14 @@ switch( N )
     case TY_CSI_PR('s', 1003) :         saveMode      (MODE_Mouse1003); break; //XTERM
     case TY_CSI_PR('r', 1003) :      restoreMode      (MODE_Mouse1003); break; //XTERM
 
+    //SGR extended mouse encoding: ESC[<b;x;yM/m instead of the 3-byte X10
+    //form, which cannot express columns beyond 223.  claude, pi and other
+    //modern TUI apps ask for this one.
+    case TY_CSI_PR('h', 1006) :          setMode      (MODE_Mouse1006); break; //XTERM
+    case TY_CSI_PR('l', 1006) :        resetMode      (MODE_Mouse1006); break; //XTERM
+    case TY_CSI_PR('s', 1006) :         saveMode      (MODE_Mouse1006); break; //XTERM
+    case TY_CSI_PR('r', 1006) :      restoreMode      (MODE_Mouse1006); break; //XTERM
+
     case TY_CSI_PR('h', 1047) :          setMode      (MODE_AppScreen); break; //XTERM
     case TY_CSI_PR('l', 1047) : _screen[1]->clearEntireScreen(); resetMode(MODE_AppScreen); break; //XTERM
     case TY_CSI_PR('s', 1047) :         saveMode      (MODE_AppScreen); break; //XTERM
@@ -830,8 +838,8 @@ void Vt102Emulation::sendString(const char* s , int length)
 */
 
 void Vt102Emulation::reportCursorPosition()
-{ char tmp[20];
-  sprintf(tmp,"\033[%d;%dR",_currentScreen->getCursorY()+1,_currentScreen->getCursorX()+1);
+{ char tmp[32];
+  snprintf(tmp,sizeof tmp,"\033[%d;%dR",_currentScreen->getCursorY()+1,_currentScreen->getCursorX()+1);
   sendString(tmp);
 }
 
@@ -869,7 +877,7 @@ void Vt102Emulation::reportSecondaryAttributes()
 void Vt102Emulation::reportTerminalParms(int p)
 // DECREPTPARM
 { char tmp[100];
-  sprintf(tmp,"\033[%d;1;1;112;112;1;0x",p); // not really true.
+  snprintf(tmp,sizeof tmp,"\033[%d;1;1;112;112;1;0x",p); // not really true.
   sendString(tmp);
 }
 
@@ -910,17 +918,34 @@ void Vt102Emulation::reportAnswerBack()
 */
 
 void Vt102Emulation::sendMouseEvent( int cb, int cx, int cy , int eventType )
-{ char tmp[20];
+{
+  char tmp[64];
   if (  cx<1 || cy<1 ) return;
+
+  const bool sgr = getMode(MODE_Mouse1006);
+  const bool motion = (getMode(MODE_Mouse1002) || getMode(MODE_Mouse1003))
+                      && eventType == 1;
+
   // normal buttons are passed as 0x20 + button,
   // mouse wheel (buttons 4,5) as 0x5c + button
-  if (cb >= 4) cb += 0x3c;
+  int b = cb;
+  if (b >= 4) b += 0x3c;
+  if (motion) b += 0x20;               // signify motion event
 
-  //Mouse motion handling
-  if ( (getMode(MODE_Mouse1002) || getMode(MODE_Mouse1003)) && eventType == 1 )
-	  cb += 0x20; //add 32 to signify motion event
-
-  sprintf(tmp,"\033[M%c%c%c",cb+0x20,cx+0x20,cy+0x20);
+  if (sgr)
+  {
+    // ESC [ < b ; x ; y M      press / motion
+    // ESC [ < b ; x ; y m      release
+    int sb = b;
+    char fin = 'M';
+    if (cb == 3) { sb = 0; fin = 'm'; }
+    snprintf(tmp, sizeof tmp, "\033[<%d;%d;%d%c", sb, cx, cy, fin);
+  }
+  else
+  {
+    // X10 form: three bytes after ESC [ M, columns above 223 cannot be sent
+    snprintf(tmp,sizeof tmp,"\033[M%c%c%c",b+0x20,cx+0x20,cy+0x20);
+  }
   sendString(tmp);
 }
 
@@ -1136,6 +1161,7 @@ void Vt102Emulation::resetModes()
   resetMode(MODE_Mouse1001); saveMode(MODE_Mouse1001);
   resetMode(MODE_Mouse1002); saveMode(MODE_Mouse1002);
   resetMode(MODE_Mouse1003); saveMode(MODE_Mouse1003);
+  resetMode(MODE_Mouse1006); saveMode(MODE_Mouse1006);
 
   resetMode(MODE_AppScreen); saveMode(MODE_AppScreen);
   // here come obsolete modes
@@ -1153,7 +1179,8 @@ void Vt102Emulation::setMode(int m)
     case MODE_Mouse1001:
     case MODE_Mouse1002:
     case MODE_Mouse1003:
- 	    emit programUsesMouseChanged(false); 
+    case MODE_Mouse1006:      // SGR is a mouse request too
+ 	    emit programUsesMouseChanged(anyMouseMode());   // still any mouse mode on?
     break;
 
     case MODE_AppScreen : _screen[1]->clearSelection();
@@ -1176,7 +1203,8 @@ void Vt102Emulation::resetMode(int m)
     case MODE_Mouse1001 :
     case MODE_Mouse1002 :
     case MODE_Mouse1003 :
-	    emit programUsesMouseChanged(true); 
+    case MODE_Mouse1006 :
+	    emit programUsesMouseChanged(anyMouseMode());  // any mouse mode left on?
     break;
 
     case MODE_AppScreen : _screen[0]->clearSelection();
@@ -1201,6 +1229,18 @@ void Vt102Emulation::restoreMode(int m)
       setMode(m); 
   else 
       resetMode(m);
+}
+
+bool Vt102Emulation::anyMouseMode() const
+{
+  // A program may turn the modes off one at a time (vim closes 1002 but keeps
+  // 1006 up while it redraws, tmux toggles single bits).  Only when the last
+  // one is gone has the program really stopped wanting mouse reports.
+  return _currParm.mode[MODE_Mouse1000]
+      || _currParm.mode[MODE_Mouse1001]
+      || _currParm.mode[MODE_Mouse1002]
+      || _currParm.mode[MODE_Mouse1003]
+      || _currParm.mode[MODE_Mouse1006];
 }
 
 bool Vt102Emulation::getMode(int m)

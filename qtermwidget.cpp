@@ -21,8 +21,13 @@
 
 #include "qtermwidget.h"
 
+#include <QtCore/QTimer>
+
 #include "Session.h"
+#include "Pty.h"        // setWriteFd(): per-tab input routing
+#include "Emulation.h"
 #include "TerminalDisplay.h"
+#include "cshell.h"
 
 #include "mymainwindow.h"
 extern CMyMainWindow *mainWindow;
@@ -89,7 +94,7 @@ TerminalDisplay *TermWidgetImpl::createTerminalDisplay(Session *session, QWidget
 }
 
 QTermWidget::QTermWidget(int startnow, QWidget *parent)
-:QWidget(parent)
+:QWidget(parent), _shell(0)
 {
     m_impl = new TermWidgetImpl(this);
     
@@ -133,12 +138,38 @@ void QTermWidget::init()
     m_impl->m_session->addView(m_impl->m_terminalDisplay);
     
     connect(m_impl->m_session, SIGNAL(finished()), this, SLOT(sessionFinished()));
+
+    // OSC 0 / OSC 2 title updates from the program running in this session.
+    connect(m_impl->m_session->emulation(), SIGNAL(titleChanged(int,QString)),
+            this, SLOT(onEmulationTitleChanged(int,QString)));
+
+    // rows/columns changed (widget resize, font change, IME strip, key bar):
+    // the pty has to be told, otherwise vim/tmux/claude draw for a grid that
+    // is not the one on screen - boxes break and the status line floats.
+    connect(m_impl->m_terminalDisplay, SIGNAL(changedContentSizeSignal(int,int)),
+            this, SLOT(onDisplayGridResized(int,int)));
 }
 
 
 QTermWidget::~QTermWidget()
 {
-    emit destroyed();
+    if (_shell) {
+        // Drop the pointers before the session goes away: the display and the
+        // send queue may outlive us by a few microseconds (child widgets are
+        // destroyed by ~QObject, after this body runs).
+        if (m_impl) {
+            if (m_impl->m_terminalDisplay)
+                m_impl->m_terminalDisplay->setInputSession(0);
+            if (m_impl->m_session && m_impl->m_session->shellProcess())
+                m_impl->m_session->shellProcess()->setWriteFd(-1);
+        }
+        _shell->hangup();
+        delete _shell;
+        _shell = 0;
+    }
+    // No emit destroyed() here: QObject emits its own destroyed(QObject*) from
+    // ~QObject, and an unqualified emit destroyed() only ever matched that
+    // signal - which made every close look like "the widget is already gone".
 }
 
 
@@ -240,6 +271,101 @@ void QTermWidget::resizeEvent(QResizeEvent*)
 {
 //+++qDebug("global window resizing...with %d %d", this->size().width(), this->size().height());
 	m_impl->m_terminalDisplay->resize(this->size());
+	syncShellWindowSize();
+	// The display may finish its row/column arithmetic after the layout settles
+	// (child resize events are delivered bottom-up), so do one deferred pass
+	// too: a full-screen TUI that gets the old size repaints itself all over.
+	QTimer::singleShot(0, this, SLOT(syncShellWindowSize()));
+}
+
+// Any change of the character grid - resize, font change, IME strip, key bar -
+// ends in TerminalDisplay::updateImageSize() emitting this.  That is the only
+// place that knows the final rows/columns, and the pty must hear about it.
+void QTermWidget::onDisplayGridResized(int, int)
+{
+	syncShellWindowSize();
+}
+
+// Attach a real pty/shell.  Data flows straight into the emulation; keys and
+// pasted text leave through the shared active-fd hook in TerminalDisplay.
+void QTermWidget::attachShell(CShellSession *shell)
+{
+    if (!shell || !m_impl)
+        return;
+
+    _shell = shell;
+
+    // Input must leave through this tab's own pty, not through whichever tab
+    // happens to be in front when the write happens.  Both the Konsole side
+    // (Pty's send queue, fed by Emulation::sendData) and the direct writes in
+    // TerminalDisplay (pastes, IME, SYM panel, meta layer) are pointed here.
+    if (m_impl->m_session && m_impl->m_session->shellProcess())
+        m_impl->m_session->shellProcess()->setWriteFd(shell->fd());
+    if (m_impl->m_terminalDisplay)
+        m_impl->m_terminalDisplay->setInputSession(shell);
+
+    connect(shell, SIGNAL(dataReceived(QByteArray)),
+            this, SLOT(onShellData(QByteArray)));
+    connect(shell, SIGNAL(finished()), this, SLOT(sessionFinished()));
+
+    // Tell the shell how wide we are before the first prompt is drawn.
+    syncShellWindowSize();
+}
+
+void QTermWidget::onShellData(const QByteArray &data)
+{
+    if (!m_impl || data.isEmpty())
+        return;
+
+    if (m_impl->m_session && m_impl->m_session->emulation())
+        m_impl->m_session->emulation()->receiveData(data.constData(), data.size());
+
+    // The SSH password helper and the pinyin IME watch the raw stream.
+    if (m_impl->m_terminalDisplay)
+        m_impl->m_terminalDisplay->onSessionOutput(QString::fromLatin1(data));
+}
+
+void QTermWidget::syncShellWindowSize()
+{
+    if (!_shell || !m_impl || !m_impl->m_terminalDisplay)
+        return;
+    _shell->setWindowSize(m_impl->m_terminalDisplay->columns(),
+                          m_impl->m_terminalDisplay->lines());
+}
+
+// OSC 0 / OSC 2: the program says what this tab should be called.
+// vim sends the file name, ssh sends "user@host: ~", a configured bash
+// sends "$PWD".  Whatever arrives has to survive a 46 px high strip, so
+// control characters are dropped and the rest is collapsed and capped.
+static QString tabTitleFromOsc(const QString &raw)
+{
+    QString t;
+    t.reserve(raw.size());
+    for (int i = 0; i < raw.size(); ++i) {
+        const int u = raw.at(i).unicode();
+        if (u < 0x20 || u == 0x7f)
+            continue;
+        t.append(raw.at(i));
+    }
+    t = t.simplified();
+    if (t.size() > 72)
+        t = t.left(72);
+    return t;
+}
+
+void QTermWidget::onEmulationTitleChanged(int what, const QString &newTitle)
+{
+    // 0 = icon + title, 2 = title only, 1 = icon only -> not our business
+    if (what == 1)
+        return;
+
+    QString t = tabTitleFromOsc(newTitle);
+    if (t.isEmpty())
+        t = _defaultTitle;      // the program cleared it again
+    if (t.isEmpty())
+        return;
+
+    emit titleChanged(t);
 }
 
 void QTermWidget::sessionFinished()

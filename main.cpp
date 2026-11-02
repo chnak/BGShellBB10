@@ -28,12 +28,23 @@
 #include <QtCore/QSettings>
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <sys/time.h>   // gettimeofday(): trackpad gesture lock timeout
+#include <stdio.h>
+#include <string.h>
+
+// Filled in by the probe in main(): the ssh client we are about to use.
+// 0.0 means "could not tell", which keeps the command builder on the
+// conservative option set (no accept-new).
+int gSshMajor = 0;
+int gSshMinor = 0;
 #include "qtermwidget.h"
 #include "mysystemmenu.h"
 #include "mymainwindow.h"
 #include "uitheme.h"
 #include <bps/virtualkeyboard.h>
 #include "mydevicetype.h"
+#include "cshell.h"
+#include "csessiontabs.h"
 
 // Headers for trackpad event handling
 #include <screen/screen.h>
@@ -48,6 +59,20 @@ int pidG_ = -1;     // child's PID
 int nKBHeight = 0;  // current Virtual Keyboard height
 int nMaxKBHeight = 0; // Maximum Keyboard Height in current mode (Landscape/Portrait)
 QTermWidget *console; // our 'main' widget, let's make it global so it is available in Menu widget
+
+// Multi-session state.  "console" above always points at the active tab, so
+// every existing call site keeps working unchanged; gActiveFd is the pty the
+// key handlers in TerminalDisplay.cpp write to.
+int            gActiveFd   = -1;
+CSessionTabs  *sessionTabs = 0;
+int            gSessionSeq = 0;
+
+// Session helpers defined below main()'s helpers block; the event filter near
+// the top of this file needs the prototypes.
+QTermWidget *bgshellCreateSession();
+void bgshellCloseSession(int index);
+void bgshellSelectSession(int index);
+void bgshellApplyFont();
 CMyMainWindow *mainWindow;
 CMySystemMenu *SystemMenu; // System menu from 'swipe down' event
 QFont font;
@@ -91,36 +116,67 @@ void handleTrackpadEvent(bps_event_t *event) {
                 // Trackpad picks candidates while composing pinyin: left/right
                 // steps the highlight, up/down turns the page. If no candidate
                 // strip is open the movement stays an arrow key for the shell.
+                //
+                // The axis is decided ONCE per gesture from the travel
+                // accumulated so far, not from each 5px sample on its own.  A
+                // thumb never swipes a perfectly straight line, and judging
+                // every frame separately was what made a sideways swipe flip
+                // the page the moment one sample leaned up or down.  The lock
+                // is dropped after a 180 ms pause, which on a trackpad means
+                // the finger was lifted.
+                static int  swipeX = 0, swipeY = 0;
+                static int  swipeAxis = 0;   // 0 undecided, 1 across, 2 down
+                static long swipeLast = 0;
                 {
-                    int dx = 0, dy = 0;
-                    if (abs(displacement[0]) > abs(displacement[1]))
-                        dx = (displacement[0] > 0) ? 1 : -1;
-                    else
-                        dy = (displacement[1] > 0) ? 1 : -1;
+                    struct timeval tv;
+                    gettimeofday(&tv, NULL);
+                    const long nowMs = tv.tv_sec * 1000L + tv.tv_usec / 1000L;
+                    if (nowMs - swipeLast > 180) {
+                        swipeX = swipeY = 0;
+                        swipeAxis = 0;
+                    }
+                    swipeLast = nowMs;
+                }
+
+                swipeX += displacement[0];
+                swipeY += displacement[1];
+
+                if (swipeAxis == 0 && (abs(swipeX) >= 12 || abs(swipeY) >= 12))
+                    swipeAxis = (abs(swipeX) > abs(swipeY)) ? 1 : 2;
+
+                int dx = 0, dy = 0;
+                if (swipeAxis == 1 && abs(swipeX) >= sens) {
+                    dx = (swipeX > 0) ? 1 : -1;
+                    swipeX -= sens * dx;
+                } else if (swipeAxis == 2 && abs(swipeY) >= 20) {
+                    // Paging is the destructive one - it can throw away the
+                    // candidate under your thumb - so it costs four times the
+                    // travel of a highlight step.
+                    dy = (swipeY > 0) ? 1 : -1;
+                    swipeY -= 20 * dy;
+                }
+
+                if (dx != 0 || dy != 0) {
                     if (console && console->imeTrackpadStep(dx, dy))
                         break;
                 }
 
-                if(abs(displacement[0]) > abs(displacement[1])) {
-                    if(displacement[0] > 0){
-                        char c[] = {0x1B,0x5B,'C'};
-                        if(bCtrlFlag)
-                            c[2] = 'c';
-                        write(masterFdG, c, 3);
-                    } else {
-                        char c[] = {0x1B,0x5B,'D'};
-                        if(bCtrlFlag)
-                            c[2] = 'd';
-                        write(masterFdG, c, 3);
-                    }
-                } else {
-                    if(displacement[1] > 0){
-                        char c[] = {0x1B,0x5B,'B'};
-                        write(masterFdG, c, 3);
-                    } else {
-                        char c[] = {0x1B,0x5B,'A'};
-                        write(masterFdG, c, 3);
-                    }
+                if(dx > 0){
+                    char c[] = {0x1B,0x5B,'C'};
+                    if(bCtrlFlag)
+                        c[2] = 'c';
+                    write(gActiveFd, c, 3);
+                } else if(dx < 0){
+                    char c[] = {0x1B,0x5B,'D'};
+                    if(bCtrlFlag)
+                        c[2] = 'd';
+                    write(gActiveFd, c, 3);
+                } else if(dy > 0){
+                    char c[] = {0x1B,0x5B,'B'};
+                    write(gActiveFd, c, 3);
+                } else if(dy < 0){
+                    char c[] = {0x1B,0x5B,'A'};
+                    write(gActiveFd, c, 3);
                 }
 
                 fprintf(stderr, "The x:'%4d', y:'%4d'\n", displacement[0],displacement[1]);
@@ -157,16 +213,18 @@ bool myEventFilter(void *message) {
 				bKBhidden = true;
 				nKBHeight = 0;
     		}
-    		console->setGeometry(0, 0, r.width()+1, r.height()-nKBHeight);
+    		if (sessionTabs)
+			sessionTabs->setGeometry(0, 0, r.width()+1, r.height()-nKBHeight);
     		
 			//font = QFont(QString("Courier New"), 6);
 			font.setPixelSize(mainWindow->nFontSize);
 		    font.setStyle(QFont::StyleNormal);
 		    font.setWeight(QFont::Normal);
-			console->setTerminalFont(font);
+			bgshellApplyFont();
     	}
    	}
- 	mainEventFilter(message); // Call replaced event filter so we deliever everything to Qt that runs in background
+ 	if (mainEventFilter)   // it is 0 until the filter is installed (and on a failed install)
+		mainEventFilter(message); // Call replaced event filter so we deliever everything to Qt that runs in background
 	return false;
 }
 
@@ -188,7 +246,7 @@ static QString installBundledFont()
                << appDir + QString("/../assets/bgscjk.ttf")
                << QDir::currentPath() + QString("/native/assets/bgscjk.ttf")
                << appDir + QString("/native/assets/bgscjk.ttf")
-               << QString("/accounts/1000/appdata/com.q30.bgshellbb10/app/native/assets/bgscjk.ttf");
+               << QString("/accounts/1000/appdata/com.q20.shell/app/native/assets/bgscjk.ttf");
 
     for (int i = 0; i < candidates.size(); ++i) {
         if (!QFile::exists(candidates.at(i)))
@@ -206,6 +264,137 @@ static QString installBundledFont()
     return QString();
 }
 
+// ---------------------------------------------------------------------------
+// Sessions: one pty + one login shell per tab
+// ---------------------------------------------------------------------------
+QTermWidget *bgshellCreateSession()
+{
+    if (!sessionTabs)
+        return 0;
+
+    CShellSession *sh = new CShellSession(sessionTabs);
+    if (!sh->start(100, 30)) {
+        qWarning("cannot start a shell session");
+        delete sh;
+        return 0;
+    }
+
+    // startnow = 0: the Konsole Session must not fork its own shell, the pty
+    // comes from CShellSession instead.
+    QTermWidget *term = new QTermWidget(0, sessionTabs);
+    term->attachShell(sh);
+    term->setTerminalFont(font);
+    term->setColorScheme(COLOR_SCHEME_BGSHELL);
+    term->setScrollBarPosition(QTermWidget::ScrollBarRight);
+
+    QSettings settings;
+    const int nHistory = settings.value("HistorySize", 2000).toInt();
+    if (nHistory > 0)
+        term->setHistorySize(nHistory);
+
+    ++gSessionSeq;
+    const QString tabTitle = QString("sh %1").arg(gSessionSeq);
+    term->setDefaultTitle(tabTitle);   // fallback when a program clears OSC 0
+    sessionTabs->addPage(term, tabTitle);
+
+    console   = term;
+    gActiveFd = sh->fd();
+    term->setFocus();
+
+    QObject::connect(term, SIGNAL(finished()), mainWindow, SLOT(sessionFinished()));
+    // OSC 0 / OSC 2 from the program running in this tab renames it.
+    QObject::connect(term, SIGNAL(titleChanged(QString)),
+                     mainWindow, SLOT(sessionTitleChanged(QString)));
+    return term;
+}
+
+// ---------------------------------------------------------------------------
+// Closing the last tab
+// ---------------------------------------------------------------------------
+// This used to call mainWindow->close() without a word.  A shell that had just
+// exited (exit, Ctrl-D, a dropped ssh) made the whole window vanish, which is
+// indistinguishable from a crash: the user is left staring at the home screen
+// with no idea whether the app died or the session ended.  Both paths now say
+// what happened and let the user pick.
+static bool bgshellAskLastTab(const QString &title, const QString &text,
+                              const QString &actionText)
+{
+    if (!mainWindow)
+        return true;
+    QMessageBox box(mainWindow);
+    box.setWindowTitle(title);
+    box.setText(text);
+    box.setIcon(QMessageBox::Question);
+    QPushButton *bDo  = box.addButton(actionText, QMessageBox::AcceptRole);
+    QPushButton *bOut = box.addButton(QString::fromUtf8("退出 BGSHELL"),
+                                      QMessageBox::RejectRole);
+    box.setDefaultButton(bDo);
+    box.exec();
+    return box.clickedButton() == bDo;
+}
+
+void bgshellCloseSession(int index)
+{
+    if (!sessionTabs)
+        return;
+    if (sessionTabs->count() <= 1) {
+        // removePage() refuses to empty the tab bar, so the last tab has to go
+        // through the window.
+        if (bgshellAskLastTab(QString::fromUtf8("关闭最后一个标签页"),
+                              QString::fromUtf8("这是唯一的标签页，关闭它会退出 BGSHELL。"),
+                              QString::fromUtf8("关闭并退出"))) {
+            if (mainWindow)
+                mainWindow->close();
+        }
+        return;
+    }
+    sessionTabs->removePage(index);   // emits currentChanged -> active fd updated
+}
+
+// Called when a tab's shell ends by itself (exit, Ctrl-D, ssh disconnect).
+void bgshellSessionEnded(int index)
+{
+    if (!sessionTabs)
+        return;
+    if (sessionTabs->count() > 1) {
+        sessionTabs->removePage(index);
+        return;
+    }
+
+    if (bgshellAskLastTab(QString::fromUtf8("shell 已退出"),
+                          QString::fromUtf8("这个标签页的 shell 已经结束")
+                          + QString::fromUtf8("（exit、Ctrl-D 或连接断开）。"),
+                          QString::fromUtf8("重新打开一个"))) {
+        // Add first, then drop the dead one: removePage() will not remove the
+        // only page, and this order keeps the tab bar non-empty throughout.
+        bgshellCreateSession();
+        sessionTabs->removePage(index);
+    } else if (mainWindow) {
+        mainWindow->close();
+    }
+}
+
+void bgshellSelectSession(int index)
+{
+    if (sessionTabs)
+        sessionTabs->setCurrentIndex(index);
+}
+
+void bgshellApplyFont()
+{
+    if (!sessionTabs || !mainWindow)
+        return;
+    font.setPixelSize(mainWindow->nFontSize);
+    font.setStyle(QFont::StyleNormal);
+    font.setWeight(QFont::Normal);
+    sessionTabs->refreshMetrics();    // tab titles are measured with the UI font
+    for (int i = 0; i < sessionTabs->count(); ++i) {
+        QTermWidget *t = qobject_cast<QTermWidget *>(sessionTabs->pageAt(i));
+        if (t)
+            t->setTerminalFont(font);
+    }
+}
+
 int main(int argc, char *argv[])
 {
     // Let's search for programs first in our own 'app' folder
@@ -216,12 +405,59 @@ int main(int argc, char *argv[])
         fprintf(stderr, "Can't determine my current folder, terminating");
         exit(-1);
     }
-    // app/native/bin holds the bundled ssh suite (ssh/scp/sftp/ssh-keygen),
-    // app/native itself stays first for anything dropped there by hand.
-    QString newPath = QString(cwd) + "/app/native/bin:" + QString(cwd) + "/app/native:" + oldPath;
+    // ---- which ssh? -----------------------------------------------------
+    // BB10 already ships OpenSSH in its read-only system partition; the app
+    // also carries a bundle (ssh/scp/sftp/ssh-keygen + libcrypto/libz) under
+    // app/native/bin for images that have none.  "data/sshclient" holds the
+    // user's pick - "system", "bundled", or absent = auto (system when it
+    // exists, bundle otherwise).  The bundle always stays on PATH, so a wrong
+    // guess falls back to the old behaviour instead of leaving no ssh at all.
+    QString sshChoice("auto");
+    {
+        QFile f(QString(cwd) + "/data/sshclient");
+        if (f.open(QIODevice::ReadOnly)) {
+            const QString s = QString::fromAscii(f.readAll()).trimmed().toLower();
+            if (s == "system" || s == "bundled")
+                sshChoice = s;
+        }
+    }
+    const QString sysSsh = QFile::exists("/base/usr/bin/ssh") ? QString("/base/usr/bin/ssh")
+                         : QFile::exists("/usr/bin/ssh")      ? QString("/usr/bin/ssh")
+                                                              : QString();
+    const bool useSystemSsh = (sshChoice == "system") ||
+                              (sshChoice == "auto" && !sysSsh.isEmpty());
+
+    const QString nativeDir = QString(cwd) + "/app/native";
+    const QString bundleBin = nativeDir + "/bin";
+    const QString bundleLib = nativeDir + "/lib";
+    const QString newPath = useSystemSsh
+        ? nativeDir + ":" + oldPath + ":" + bundleBin
+        : bundleBin + ":" + nativeDir + ":" + oldPath;
     qputenv("PATH", newPath.toAscii().data());
-    newPath = QString(cwd) + "/app/native/lib:/usr/lib/qt4/lib:" + oldLDPath;
-    qputenv("LD_LIBRARY_PATH", newPath.toAscii().data());
+    // Never let our libcrypto/libz shadow the ones a system ssh was linked
+    // against; when the bundle is the active client the order is reversed.
+    const QString newLd = useSystemSsh
+        ? nativeDir + "/lib:/usr/lib/qt4/lib:" + oldLDPath + ":" + bundleLib
+        : bundleLib + ":/usr/lib/qt4/lib:" + oldLDPath;
+    qputenv("LD_LIBRARY_PATH", newLd.toAscii().data());
+
+    // Version matters: -o StrictHostKeyChecking=accept-new needs OpenSSH 7.6;
+    // older clients reject that value and fall back to an interactive yes/no
+    // prompt, which on a phone keyboard is a dead end.
+    {
+        FILE *p = popen("ssh -V 2>&1", "r");
+        if (p) {
+            char vbuf[256] = { 0 };
+            if (fgets(vbuf, sizeof(vbuf) - 1, p)) {
+                const char *v = strstr(vbuf, "OpenSSH_");
+                if (v)
+                    sscanf(v + 8, "%d.%d", &gSshMajor, &gSshMinor);
+            }
+            pclose(p);
+        }
+        qDebug() << "ssh client:" << (useSystemSsh ? "system" : "bundled")
+                 << sysSsh << "version" << gSshMajor << "." << gSshMinor;
+    }
 
     // The bundled ssh suite ships as assets; some installers drop the exec bit
     // from files inside a .bar, so make sure the tools stay runnable.
@@ -234,36 +470,10 @@ int main(int argc, char *argv[])
         }
     }
     
-	// Init file descriptors opening proper devices
-	masterFdG = ::open("/dev/ptyp1", O_RDWR);
-	slaveFdG = ::open("/dev/ttyp1", O_RDWR | O_NOCTTY);
-	// And here is where magic begins
-    pidG_ = fork();
-    if (pidG_ == 0) {
-        dup2(slaveFdG, STDIN_FILENO);
-        dup2(slaveFdG, STDOUT_FILENO);
-        dup2(slaveFdG, STDERR_FILENO);
-
-        // reset all signal handlers
-        struct sigaction act;
-        sigemptyset(&act.sa_mask);
-        act.sa_handler = SIG_DFL;
-        act.sa_flags = 0;
-        for (int sig = 1; sig < NSIG; sig++)
-          sigaction(sig, &act, 0L);
-
-        // All we want in child process is to have sh running
-        const char *arglist[] = {"/bin/sh", "-l", NULL};
-        execvp(arglist[0], (char**)arglist);
-    } else if (pidG_ == -1) {
-        // fork() failed
-  	    qDebug() << "fork() failed:";
-        pidG_ = 0;
-        return false;
-    }
-    // Drop garbage that is shown when you start the app
-    char cGarbage[72];
-    read(masterFdG, cGarbage, 72);
+    // Sessions are no longer forked here: every tab owns a pty pair and a
+    // login shell (see cshell.cpp).  masterFdG / slaveFdG / pidG_ stay
+    // defined because the patched Konsole layer still references them, but
+    // nothing starts a process at startup any more.
 
     // needed for correct QT initialization
     //qputenv("QT_QPA_FONTDIR", "/usr/fonts/font_repository/dejavu-ttf-2.17"); // needed for correct QT initialization
@@ -287,36 +497,37 @@ int main(int argc, char *argv[])
     if (r.width() == 1440)
         dtDevice = BB_PASSPORT;
 
-    console = new QTermWidget(1, mainWindow);
+    // One strip of browser-style tabs.  Every page is a QTermWidget with its
+    // own pty pair and its own login shell (cshell.cpp), so an ssh session in
+    // one tab no longer blocks the shell in another.
+    sessionTabs = new CSessionTabs(mainWindow);
+    sessionTabs->setGeometry(0, 0, r.width() + 1, r.height() - nKBHeight);
+
+    // The settings card.  It is a sibling of the tab strip, anchored below the
+    // gear at its right end (mysystemmenu.cpp), so it must be raised when it
+    // opens.  A swipe down from the top bezel still brings it up as well.
+    SystemMenu = new CMySystemMenu(mainWindow);
+    SystemMenu->MenuInit();
 
     font = QFont(gTerminalFontFamily.isEmpty() ? QString("Courier New")
                                                : gTerminalFontFamily, 6);
     font.setPixelSize(mainWindow->nFontSize);
     font.setStyle(QFont::StyleNormal);
     font.setWeight(QFont::Normal);
-    console->setTerminalFont(font);
-    // "Midnight": the app's own colour table, matched to the UI accent.
-    console->setColorScheme(COLOR_SCHEME_BGSHELL);
 
     // We start the app with shown keyboard (it does not make any harm for devices with physical keyboard)
-	virtualkeyboard_change_options(VIRTUALKEYBOARD_LAYOUT_DEFAULT, VIRTUALKEYBOARD_ENTER_DEFAULT);
-	console->setGeometry(0, 0, r.width()+1, r.height()-nKBHeight);
-    console->setScrollBarPosition(QTermWidget::ScrollBarRight);
+    virtualkeyboard_change_options(VIRTUALKEYBOARD_LAYOUT_DEFAULT, VIRTUALKEYBOARD_ENTER_DEFAULT);
 
-    // Scrollback depth is a user setting (设置 -> 回滚缓冲行数); 2000 lines
-    // matches what the widget used before the setting existed.
-    {
-        QSettings settings;
-        int nHistory = settings.value("HistorySize", 2000).toInt();
-        if (nHistory > 0)
-            console->setHistorySize(nHistory);
-    }
+    console = bgshellCreateSession();   // first tab
 
-    // Our system menu
-    SystemMenu = new CMySystemMenu(mainWindow);
-    SystemMenu->MenuInit();
-
-    QObject::connect(console, SIGNAL(finished()), mainWindow, SLOT(close()));
+    QObject::connect(sessionTabs, SIGNAL(currentChanged(int)),
+                     mainWindow, SLOT(sessionCurrentChanged(int)));
+    QObject::connect(sessionTabs, SIGNAL(newSessionRequested()),
+                     mainWindow, SLOT(sessionNew()));
+    QObject::connect(sessionTabs, SIGNAL(closeRequested(int)),
+                     mainWindow, SLOT(sessionClose(int)));
+    QObject::connect(sessionTabs, SIGNAL(settingsRequested()),
+                     mainWindow, SLOT(sessionMenu()));
 
     mainWindow->show();    
 

@@ -166,6 +166,15 @@ Q_OBJECT
      */
     void sendData(const char* buffer, int length);
 
+    /** Route this object's input to @a fd (the pty of its own tab).
+     *
+     *  Without it every Pty writes through the global "active tab" fd, which
+     *  is wrong the moment two tabs exist: a keystroke still queued when the
+     *  user switches tabs would go to the shell of the tab that just came to
+     *  the front.  -1 keeps the old global behaviour. */
+    void setWriteFd(int fd) { _writeFd = fd; }
+    int  writeFd() const { return _writeFd; }
+
   signals:
 
     /**
@@ -230,6 +239,7 @@ Q_OBJECT
     };
 
     QList<SendJob> _pendingSendJobs;
+    int  _writeFd;          // this tab's pty, -1 = fall back to gActiveFd
     bool _bufferFull;
 
     int  _windowColumns; 

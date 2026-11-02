@@ -40,9 +40,10 @@ int CMySystemMenu::MenuInit(){
 	for (int i = 0; i < 2; ++i) {
 		both[i]->setStyleSheet(QString(
 		    "QToolButton { background-color: transparent; border: none;"
-		    "  color: %1; font-size: 27px; padding: 0px; }"
+		    "  color: %1; font-size: 27px; padding: 0px 0px 0px 22px;"
+		    "  text-align: left; }"
 		    "QToolButton:pressed { background-color: rgba(0, 224, 90, 46);"
-		    "  border-radius: 16px; }")
+		    "  border-radius: 12px; }")
 		    .arg(UiTheme::hex(UiTheme::Text)));
 	}
 
@@ -55,17 +56,22 @@ int CMySystemMenu::MenuInit(){
 
 void CMySystemMenu::SetGeometry(){
 	QRect r = QApplication::desktop()->screenGeometry(0);
-	int nScreenWidth = r.width();
-	const int nHeight = 116;
-	this->setGeometry(0, 0, nScreenWidth, nHeight);
+	const int nScreenWidth = r.width();
 
-	const int nPad = 16;
-	const int nGap = 10;
-	int nBtnWidth = (nScreenWidth - 2 * nPad - nGap) / 2;
-	btnSettings->setGeometry(QRect(nPad, nPad, nBtnWidth, nHeight - nPad * 2));
-	btnCmds    ->setGeometry(QRect(nPad + nBtnWidth + nGap, nPad,
-	                               nScreenWidth - 2 * nPad - nGap - nBtnWidth,
-	                               nHeight - nPad * 2));
+	// The card hangs off the right end of the tab strip: the gear there opens
+	// it (a swipe from the top bezel still works too, see mainWindow::event).
+	// 54 = tab strip (46 px) + 8 px of air, so the tabs stay readable.
+	const int nW    = qMin(340, nScreenWidth - 24);
+	const int nRowH = 92;
+	const int nPad  = 10;
+	const int nGap  = 8;
+	const int nH    = nPad * 2 + nRowH * 2 + nGap;
+
+	this->setGeometry(nScreenWidth - nW - 12, 54, nW, nH);
+
+	const int nBtnW = nW - 2 * nPad;
+	btnSettings->setGeometry(QRect(nPad, nPad, nBtnW, nRowH));
+	btnCmds    ->setGeometry(QRect(nPad, nPad + nRowH + nGap, nBtnW, nRowH));
 }
 
 void CMySystemMenu::paintEvent(QPaintEvent *)
@@ -73,23 +79,25 @@ void CMySystemMenu::paintEvent(QPaintEvent *)
 	QPainter p(this);
 	p.setRenderHint(QPainter::Antialiasing, true);
 
-	const int radius = 26;
-
-	// Rounded card whose top edge is off-screen: only the bottom corners
-	// show, which reads as a panel sliding down from the bezel.
+	// A floating card, so the terminal under it keeps showing through at the
+	// rounded corners instead of a grey rectangle.
+	const int radius = 18;
 	QPainterPath path;
-	path.addRoundedRect(QRectF(0, -radius, width(), height() + radius),
+	path.addRoundedRect(QRectF(0.5, 0.5, width() - 1, height() - 1),
 	                    radius, radius);
 	p.setPen(QPen(UiTheme::Border, 1));
 	p.setBrush(QColor(18, 24, 29, 248));
 	p.drawPath(path);
 
-	// Accent hairline on the bottom edge + a divider between the two halves.
+	// Accent hairline along the top edge - the same accent the active tab
+	// wears, so the card reads as part of the strip.
 	p.setPen(QPen(UiTheme::Accent, 2));
-	p.drawLine(radius, height() - 1, width() - radius, height() - 1);
+	p.drawLine(radius, 1, width() - radius, 1);
 
+	// Divider between the two entries.
 	p.setPen(QPen(QColor(43, 53, 64, 200), 1));
-	p.drawLine(width() / 2, 30, width() / 2, height() - 30);
+	const int y = btnSettings->geometry().bottom() + 4;
+	p.drawLine(16, y, width() - 16, y);
 }
 
 void CMySystemMenu::on_btnSettings_clicked(){

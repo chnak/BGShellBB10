@@ -66,6 +66,13 @@ public:
   Q_PROPERTY(QString keyBindings READ keyBindings WRITE setKeyBindings)
   Q_PROPERTY(QSize size READ size WRITE setSize)
 
+  /** The Konsole process object that owns this session's input queue.
+   *
+   *  Only used to point the queue at a specific pty: the actual shell is
+   *  started by CShellSession, not by Konsole, so this object is never run.
+   *  Returns 0 before the session is constructed. */
+  Pty* shellProcess() const { return _shellProcess; }
+
   /**
    * Constructs a new session.
    *

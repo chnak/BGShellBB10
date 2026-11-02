@@ -47,7 +47,8 @@
 #define MODE_Mouse1002 (MODES_SCREEN+5)
 #define MODE_Mouse1003 (MODES_SCREEN+6)
 #define MODE_Ansi      (MODES_SCREEN+7)
-#define MODE_total     (MODES_SCREEN+8)
+#define MODE_Mouse1006 (MODES_SCREEN+8)   // SGR extended mouse encoding
+#define MODE_total     (MODES_SCREEN+9)
 
 namespace Konsole
 {
@@ -134,6 +135,8 @@ private:
 
   // returns true if 'mode' is set or false otherwise
   bool getMode    (int mode);
+  // true while any of the ?1000/?1001/?1002/?1003/?1006 mouse modes is on
+  bool anyMouseMode() const;
   // saves the current boolean value of 'mode'
   void saveMode   (int mode);
   // restores the boolean value of 'mode' 

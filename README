@@ -135,6 +135,90 @@ Release notes:
     -- scrollback depth is a setting now (500 / 1000 / 2000 / 5000 / 10000);
        applied at startup and to the running session
 
+- 0.0.3.9
+    -- fixed the stray spaces / line break that followed "pick a word with
+       Space": committing empties the composition at once, but the echo of
+       the character is still a pty round trip away, and a Space held down
+       through that window auto-repeats into the shell (a full line then
+       wraps). Space auto-repeat is now dropped for 400ms after a commit
+       - Space only, other keys keep repeating as before;
+    -- Space now takes the highlighted candidate and falls back to candidate
+       1 when the strip has nothing laid out, instead of swallowing the key
+       silently - a dead Space is what makes people press it again;
+    -- refresh order reversed: update the strip, then write the pty, then
+       repaint the terminal immediately, so the strip no longer waits for
+       the echo to catch up;
+    -- the strip only re-lays out when its geometry really changed
+       (setState already laid it out), one less relayout per key press.
+
+- 0.0.3.9
+    -- fixed the stray spaces / line break that followed "pick a word with
+       Space": committing empties the composition at once, but the echo of
+       the character is still a pty round trip away, and a Space held down
+       through that window auto-repeats into the shell (a full line then
+       wraps). Space auto-repeat is now dropped for 400ms after a commit
+       - Space only, other keys keep repeating as before;
+    -- Space now takes the highlighted candidate and falls back to candidate
+       1 when the strip has nothing laid out, instead of swallowing the key
+       silently - a dead Space is what makes people press it again;
+    -- refresh order reversed: update the strip, then write the pty, then
+       repaint the terminal immediately, so the strip no longer waits for
+       the echo to catch up;
+    -- the strip only re-lays out when its geometry really changed
+       (setState already laid it out), one less relayout per key press.
+
+- 0.0.3.8
+    -- the pinyin strip no longer covers the cursor line: while the Chinese
+       mode is on, the terminal keeps the strip's height free under its last
+       row and the strip is painted into that gap; the row count goes out
+       through changedContentSizeSignal, the very same path the on-screen
+       keyboard uses, so the shell re-wraps as usual;
+    -- the gap exists for as long as the Chinese mode is on, not per word: 
+       reserving and releasing on every commit would fire a SIGWINCH each
+       time and make vim / less redraw in a loop;
+    -- smaller strip: 78px -> 52px, candidates 30px -> 22px, digits and the
+       pinyin buffer 17px -> 14px, which buys a row back on short screens;
+    -- the idle state (mode on, nothing being composed) no longer hides the
+       strip: it shows "拼音输入 · 直接打字，Esc 取消" so the two missing rows
+       make sense; while idle it takes no touches, so swipes still reach the
+       terminal.
+
+- 0.0.3.7
+    -- the swipe-down card could only be dismissed by swiping down again: the
+       framework reports the downward edge gesture and nothing else. It now
+       closes when the finger travels 60px upwards while it is open, and a tap
+       on the terminal underneath closes it too (that tap is swallowed, so
+       nothing gets typed into the shell)
+    -- new app icon: dark tile with a gradient-green ">_" prompt, same palette
+       as the UI; regenerate with tools/make_icon.py, or roll back the four
+       PNGs backed up in tools/icon-backup/
+
+- 0.0.3.6
+    -- fixed the paper-white backdrop on the add / edit SSH host page:
+       QScrollArea::setWidget() re-enables autoFillBackground() on the scrolled
+       widget, so the form was filled with the platform's paper colour;
+       UiTheme::styleScrollArea() now colours the viewport instead (the settings
+       scroll area had the same bug and is fixed too)
+    -- the SYM grid grew a control row - Esc, Tab and Shift+Tab. BB10 has no Tab
+       key and Esc lives in the CTRL layer; Esc closes the grid, Tab and
+       Shift+Tab keep it open so they can be tapped repeatedly
+
+- 0.0.3.5
+    -- the chrome got one design pass: a single dark palette (uitheme.h)
+       shared by menu, settings, panels and dialogs, plus a "Midnight"
+       terminal scheme whose ANSI colours match the UI accent
+    -- swipe-down menu is a rounded card with one green hairline instead of
+       a grey strip; the two halves are separated by a divider
+    -- settings is now cards (title + scrollable card list + green primary
+       button), every option carrying a one-line hint
+    -- command / SSH panel rebuilt: segmented tabs, two-line rows (name plus
+       command or user@host:port in mono), primary/secondary/danger buttons,
+       an empty-state hint and a labelled editor page
+    -- help window, long-press menu and the dropped-connection strip (now a
+       rounded amber card) follow the same style
+    -- the window behind the terminal is the same dark colour, so resizing
+       for the keyboard no longer flashes grey
+
 - 0.0.3.2
     -- quick commands / SSH hosts panel (swipe-down menu -> Cmds / SSH)
     -- a command can be run or only inserted on the command line; a few
@@ -143,6 +227,37 @@ Release notes:
        typed at the pty when ssh asks for it (once, 30 s timeout)
     -- the password is only XOR+Base64 obfuscated, not encrypted; keys are
        the recommended way
+
+## Look and feel
+
+Every surface is built from one set of tokens (`uitheme.h`), so the menu, the
+settings, the panels and the dialogs read as one app:
+
+| role | colour |
+| --- | --- |
+| backdrop | `#0b0e11` |
+| cards / dialogs / menus | `#141a1f` |
+| inputs / buttons | `#1b2229` |
+| hairlines | `#2b3540` |
+| text | `#e8edf2` |
+| secondary text | `#8d9aa7` |
+| accent (primary action, selection) | `#00e05a` |
+| danger (delete) | `#ff5f56` |
+
+* **Midnight terminal scheme**: backdrop `#0b0e11`, foreground `#d7e0ea`, the
+  sixteen ANSI colours retuned so nothing glares on a 720x720 panel; the
+  green/blue/yellow entries sit in the same hue family as the UI accent.
+* **One font**: the bundled Maple Mono NF CN subset is used for both the
+  terminal and the chrome, so Chinese text and commands stop switching faces.
+* **Radii and sizes**: cards 18 px, buttons 14 px, menu items 10 px; nothing
+  tappable is shorter than 58 px.
+* **Three button weights**: solid green for the primary action (run / connect /
+  save / close), outlined for the secondary ones, red text for delete.
+* **Two-line list rows**: name on top, command or `user@host:port` below in
+  mono, elided when long; the selected row grows a green bar on the left.
+* **Settings scroll** and split into "connection" / "appearance" cards, each
+  option with a one-line explanation.
+* **The dropped-connection strip** is a rounded amber card now, not a red box.
 
 ## Quick commands and SSH hosts (swipe-down menu -> Cmds / SSH)
 
@@ -299,6 +414,18 @@ that reports SYM as a bare Escape keeps working through that fallback, since
 the phones have no Escape key of their own (Esc is `e` in the CTRL layer).
 This replaces the old `myvk` `vk.png` picture, which only *showed* the
 symbols and had to be dismissed by pressing a key.
+The grid also carries a control row along its bottom edge:
+
+```
+ Esc          Tab          Shift+Tab
+```
+
+BB10's keyboard has no Tab key at all and Escape is buried in the CTRL layer
+(double-tap right Shift, then `e`), so neither is reachable from a terminal
+prompt. **Esc** sends `0x1b` and closes the grid (that is what you reach for
+Esc for); **Tab** sends `0x09` and **Shift+Tab** sends `ESC [ Z`, and both keep
+the grid up so it can be tapped a few times in a row before SYM / Esc folds it
+away again.
 
 ### 中文输入法: pinyin input inside the terminal
 

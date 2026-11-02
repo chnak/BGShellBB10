@@ -25,6 +25,7 @@
 #include <QtGui>
 
 struct TermWidgetImpl;
+class CShellSession;
 
 enum COLOR_SCHEME {     COLOR_SCHEME_WHITE_ON_BLACK	= 1,
 		        COLOR_SCHEME_GREEN_ON_BLACK,
@@ -92,20 +93,44 @@ public:
 
     // Quick commands / saved SSH hosts (system menu -> "Cmds").
     void toggleCommandPanel();
+
+    // Multi-session support: hand this widget its own pty/shell.  Without it
+    // the widget would ask Konsole's Session to fork a shell through the
+    // patched kpty/k3process pair, which can only ever serve one session.
+    void attachShell(CShellSession *shell);
+    CShellSession *shell() const { return _shell; }
+
+    // Push the current character grid to the pty (TIOCSWINSZ).
+    void syncShellWindowSize();
+
+    // Tab title.  Programs announce it with OSC 0 / OSC 2
+    // ("\033]0;user@host: ~/src\007"); vim, tmux, ssh and bash all do.
+    // The default is used when the program clears the title again.
+    void setDefaultTitle(const QString &title) { _defaultTitle = title; }
             
 signals:
     void finished();
+    void titleChanged(const QString &title);
         
 protected: 
     virtual void resizeEvent(QResizeEvent *);
     virtual bool event( QEvent * ); //+++
     
 protected slots:
-    void sessionFinished();        
+    void sessionFinished();
+    void onShellData(const QByteArray &data);
+    // The character grid changed size because the widget, the font or the
+    // bottom reserve changed - push it to the pty (TIOCSWINSZ).  Konsole's own
+    // plumbing cannot do this for us: the Pty object it keeps is never
+    // started, so its setWindowSize() is a no-op.
+    void onDisplayGridResized(int height, int width);
+    void onEmulationTitleChanged(int what, const QString &newTitle);
     
 private:
     void init();    
     TermWidgetImpl *m_impl;
+    CShellSession   *_shell;
+    QString          _defaultTitle;
 };
 
 

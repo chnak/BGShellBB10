@@ -13,6 +13,14 @@ LIBS += -lbbplatform -lscreen
 device {
 	CONFIG(release, debug|release) {
 		DESTDIR = o.le-v7
+		# The QNX mkspec appends -Os at the end of the flag list, so the release
+		# build optimises for size (-Os after -O2 wins).  That is fine on a
+		# Cortex-A9 - smaller code, friendlier to the i-cache.  What is *not*
+		# optional is -fno-strict-aliasing: the Konsole code base type-puns
+		# Character/int in a few places (20 -Wstrict-aliasing warnings at -Wall)
+		# and the optimiser is otherwise free to miscompile them.
+		QMAKE_CFLAGS_RELEASE   += -fno-strict-aliasing
+		QMAKE_CXXFLAGS_RELEASE += -fno-strict-aliasing
 	}
 	CONFIG(debug, debug|release) {
 		DESTDIR = o.le-v7-g

@@ -87,6 +87,7 @@ Screen::Screen(int l, int c)
     sa_cu_re(0),
     lastPos(-1)
 {
+  _alternateScreen = false;   // set here: it is declared far from the others
   lineProperties.resize(lines+1);
   for (int i=0;i<lines+1;i++)
           lineProperties[i]=LINE_DEFAULT;
@@ -305,6 +306,12 @@ void Screen::insertLines(int n)
 
 void Screen::setMode(int m)
 {
+  // MODE_AppScreen is MODES_SCREEN+0 and belongs to the emulation (it picks
+  // which of the two screens is current); currParm.mode[] only has
+  // MODES_SCREEN slots, so forwarding it here used to write one int past the
+  // array.  Ignore anything outside the array.
+  if (m < 0 || m >= MODES_SCREEN)
+    return;
   currParm.mode[m] = true;
   switch(m)
   {
@@ -316,6 +323,8 @@ void Screen::setMode(int m)
 
 void Screen::resetMode(int m)
 {
+  if (m < 0 || m >= MODES_SCREEN)
+    return;
   currParm.mode[m] = false;
   switch(m)
   {
@@ -327,6 +336,8 @@ void Screen::resetMode(int m)
 
 void Screen::saveMode(int m)
 {
+  if (m < 0 || m >= MODES_SCREEN)
+    return;
   saveParm.mode[m] = currParm.mode[m];
 }
 
@@ -334,11 +345,15 @@ void Screen::saveMode(int m)
 
 void Screen::restoreMode(int m)
 {
+  if (m < 0 || m >= MODES_SCREEN)
+    return;
   currParm.mode[m] = saveParm.mode[m];
 }
 
 bool Screen::getMode(int m) const
 {
+  if (m < 0 || m >= MODES_SCREEN)
+    return false;
   return currParm.mode[m];
 }
 

@@ -170,7 +170,7 @@ void CCommandPanel::buildUi()
 
 	head->addLayout(headText, 1);
 
-	_btnClose = makeButton(this, QString::fromUtf8("✕"), "icon", 58);
+	_btnClose = makeButton(this, QString::fromUtf8("×"), "icon", 58);
 	_btnClose->setFixedWidth(58);
 	head->addWidget(_btnClose, 0, Qt::AlignTop);
 	root->addLayout(head);
@@ -206,13 +206,12 @@ void CCommandPanel::buildUi()
 	_pages->addWidget(_sshList);
 
 	// ---- editor -------------------------------------------------------
-	QScrollArea *scroll = new QScrollArea(_pages);
-	scroll->setFrameShape(QFrame::NoFrame);
+	UiTheme::ScrollPane *scroll = new UiTheme::ScrollPane(_pages);
 	scroll->setWidgetResizable(true);
 	scroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
-	scroll->viewport()->setAutoFillBackground(false);
 
 	_editor = new QWidget(scroll);
+	_editor->setObjectName(QString("panelPage"));
 	_editor->setAutoFillBackground(false);
 	QVBoxLayout *form = new QVBoxLayout(_editor);
 	form->setContentsMargins(2, 2, 10, 2);
@@ -254,6 +253,8 @@ void CCommandPanel::buildUi()
 	form->addStretch(1);
 
 	scroll->setWidget(_editor);
+	// after setWidget(), never before: that call re-enables the white backdrop
+	UiTheme::styleScrollArea(scroll, UiTheme::Bg);
 	_pages->addWidget(scroll);
 
 	root->addWidget(_pages, 1);

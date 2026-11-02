@@ -45,12 +45,21 @@ public:
 	void dismiss();
 	bool isOpen() const { return isVisible(); }
 
+	// Pixels already taken at the very bottom (the custom key strip). The
+	// candidate strip sits on top of it instead of covering it.
+	void setBottomOffset(int px);
+
+	// Height the terminal has to keep free below its last row, so the strip
+	// sits *under* the text instead of on top of the cursor line.
+	int stripHeight() const;
+
 	// Trackpad / arrow key driving. delta = +1 next, -1 previous; the step
 	// wraps around the candidates that are actually on screen and is paced
 	// like a key repeat, because the trackpad streams events.
 	void moveHighlight(int delta);
 	int  highlight() const { return _highlight; }
 	void commitHighlighted();      // emits candidateChosen(highlight)
+	bool hasHighlight() const;     // is there a candidate Space / tap can take
 
 signals:
 	void candidateChosen(int index);   // 0 based, into the current page
@@ -59,16 +68,20 @@ signals:
 protected:
 	void paintEvent(QPaintEvent *event);
 	void mousePressEvent(QMouseEvent *event);
+	// Same trap as the key strip: the second tap of a fast double tap arrives
+	// as a DblClick, so without this every other candidate tap is swallowed.
+	void mouseDoubleClickEvent(QMouseEvent *event);
 
 private:
 	void relayout();
-	int  heightForStrip() const;
+	bool idle() const { return _buffer.isEmpty() && _candidates.isEmpty(); }
 
 	QString     _buffer;
 	QStringList _candidates;
 	int         _page;
 	int         _pages;
 	int         _highlight;   // index into the candidates of this page
+	int         _bottomOffset; // pixels taken below by the key strip
 	QTime       _lastStep;    // pacing for moveHighlight()
 
 	QList<QRect> _candidateRects;

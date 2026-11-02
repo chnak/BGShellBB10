@@ -43,6 +43,7 @@ class QDropEvent;
 class QLabel;
 class CSymbolPanel;
 class CImePanel;
+class CKeyBar;
 class CCommandPanel;
 class QTimer;
 class QEvent;
@@ -55,6 +56,9 @@ class QShowEvent;
 class QHideEvent;
 class QWidget;
 
+// Global (not in namespace Konsole): the tab's session object lives in the
+// application layer, next to QTermWidget.
+class CShellSession;
 //class KMenu;
 
 namespace Konsole
@@ -81,6 +85,15 @@ public:
     /** Constructs a new terminal display widget with the specified parent. */
     TerminalDisplay(QWidget *parent=0);
     virtual ~TerminalDisplay();
+
+    /** Point this display at the pty its tab owns.
+     *
+     *  Everything the user types (keys, pastes, IME, the SYM panel and the
+     *  meta layer) is written through this session.  The previous scheme used
+     *  one global "active fd", so a key event that was already queued when the
+     *  user switched tabs could be delivered to the shell of the tab that just
+     *  became visible. */
+    void setInputSession(CShellSession *session) { _inputSession = session; }
 
     /** Returns the terminal color palette used by the display. */
     const ColorEntry* colorTable() const;
@@ -375,10 +388,22 @@ public:
     void setImeMode(bool on);
     void toggleImeMode();
     bool imeMode() const { return _imeOn; }
+
+    // The custom key strip: one tap types a byte sequence the BB10 keyboard
+    // has no key for (Esc, Ctrl-C, arrows, or a whole command line).
+    void setKeyBarEnabled(bool on);
+    bool keyBarEnabled() const { return _keyBarOn; }
+    void reloadKeyBar();          // after the item list was edited
     bool handleImeKey(QKeyEvent* event);   // true when the key was consumed
     void refreshImePanel();
     void closeImePanel();
     void sendImeSym(int sym);               // feed one key to the engine
+
+    // Keeps `px` pixels free under the last row (the IME strip lives there).
+    // Recomputes rows/columns, so the shell gets a SIGWINCH - same thing the
+    // on-screen keyboard does when it slides over the window.
+    void setBottomReserve(int px);
+    int  bottomReserve() const { return _bottomReserve; }
 
     // Trackpad of a Q20 / Q10 / Q5 / Classic. Returns true when the candidate
     // strip took the movement (or the click), so the caller sends no arrow key
@@ -569,6 +594,7 @@ protected:
 
     virtual void keyPressEvent(QKeyEvent* event);
     virtual void keyReleaseEvent(QKeyEvent* event);
+    virtual void focusOutEvent(QFocusEvent* event);
     virtual void mouseDoubleClickEvent(QMouseEvent* ev);
     virtual void mousePressEvent( QMouseEvent* );
     virtual void mouseReleaseEvent( QMouseEvent* );
@@ -605,6 +631,11 @@ protected slots:
     void scrollBarPositionChanged(int value);
     void blinkEvent();
     void blinkCursorEvent();
+    void refreshWatchdog();
+    // Paints into the backing store directly, without going through the
+    // update()/repaint() machinery. Used only when that machinery demonstrably
+    // dropped the request.
+    void forceRepaintNow();
     
     //Renables bell noises and visuals.  Used to disable further bells for a short period of time
     //after emitting the first in a sequence of bell events.
@@ -616,12 +647,19 @@ private slots:
     void onTouchLongPress();  // finger held down: select the line, show the menu
     void tripleClickTimeout();  // resets possibleTripleClick
     void onSymbolChosen(const QString &text);
+    void onSymbolControlKey(const QString &bytes, bool keepOpen);
     void onImeCandidateChosen(int index);
     void onImePageRequested(int delta);
+    void onKeyBarClicked(const QByteArray &bytes);
     void onDisconnectReconnect();   // "重连" on the dropped-connection banner
     void onDisconnectDismiss();     // "x" on the same banner
+    void showSshDiagnostics();      // tail of data/ssh.log after a failed login
 
 private:
+
+    // Writes to the pty of this tab (falls back to the active-tab fd if no
+    // session was attached).  All input paths funnel through here.
+    void writeInputBytes(const char *b, int n);
 
     // -- Drawing helpers --
 
@@ -629,6 +667,13 @@ private:
     // fragments according to their colors and styles and calls
     // drawTextFragment() to draw the fragments 
     void drawContents(QPainter &paint, const QRect &rect);
+
+    // Pure geometry, no state: the widget rect of one grid row, and the whole
+    // character grid.  paintEvent() works in rows because a row is the only
+    // unit that can be repainted without ever leaving a strip of the previous
+    // frame behind.
+    QRect rowRect(int row) const;
+    QRect textAreaRect() const;
     // draws a section of text, all the text in this section
     // has a common color and style
     void drawTextFragment(QPainter& painter, const QRect& rect, 
@@ -656,6 +701,15 @@ private:
 
     // maps an area in the character image to an area on the widget 
     QRect imageToWidget(const QRect& imageArea) const;
+
+    // Left edge of character column 0 in widget coordinates, including the
+    // centring offset that drawContents() applies.  Every other place that
+    // maps between grid and widget - dirty rects, scroll rects, cursor,
+    // selection, touch hit testing - must use this same origin.  Computing a
+    // dirty rect without it leaves a vertical strip of the previous frame
+    // along the right edge of every line: that is the "ghosting" the users
+    // see in full screen apps.
+    int textOriginX() const;
 
     // maps a point on the widget to the position ( ie. line and column ) 
     // of the character at that point.
@@ -720,6 +774,8 @@ private:
     int _contentHeight;
     int _contentWidth;
     Character* _image; // [lines][columns]
+    Character* _snapshot;   // grid as of the last successful paint (row memcmp base)
+    bool _snapshotValid;    // false forces the next paint to redraw every row
                // only the area [usedLines][usedColumns] in the image contains valid data
 
     int _imageSize;
@@ -751,18 +807,26 @@ private:
 
     bool _blinking;   // hide text in paintEvent
     bool _hasBlinker; // has characters to blink
+    QList<int> _blinkLines;  // rows that contain RE_BLINK text (blinkEvent repaints only these)
+    bool _needsFullRepaint;  // output arrived while the tab was hidden
+    int  _imgUpdates;        // updateImage() calls, for the render diagnostic
+    int  _paintedUpdate;     // value of _imgUpdates at the last paintEvent
+    int  _watchdogTries;     // consecutive watchdog attempts that changed nothing
+    bool _inPaint;           // inside paintEvent()/forceRepaintNow()
+    int  _forceCount;        // direct QPainter paints of the backing store
+    qint64 _lastIdleProbeMs; // last paint-channel liveness probe (full repaint)
+    qint64 _lastTickMs;      // watchdog clock, detects a stalled UI thread
     bool _cursorBlinking;     // hide cursor in paintEvent
     bool _hasBlinkingCursor;  // has blinking cursor enabled
     bool _ctrlDrag;           // require Ctrl key for drag
     TripleClickMode _tripleClickMode;
     bool _isFixedSize; //Columns / lines are locked.
     QTimer* _blinkTimer;  // active when hasBlinker
+    QTimer* _refreshTimer; // watchdog: output on the grid but not on screen
     QTimer* _blinkCursorTimer;  // active when hasBlinkingCursor
 
     // Term50-style key layer state
-    bool    _metaArmed;        // sticky CTRL layer armed by a double tap
-    qint64  _metaLastRightMs;  // timestamp of the previous Right press
-    qint64  _metaLastShiftMs;  // timestamp of the previous Shift press
+    bool    _metaArmed;        // sticky CTRL layer (no entry point any more: right Shift is hold-only)
     bool    _ctrlHeld;         // right Shift held => acts as Ctrl
     int     _lastShiftNative;  // native virtual key of the last Shift (diag)
     int     _lastShiftScan;    // native scan code of the last Shift (diag)
@@ -770,14 +834,21 @@ private:
     QLabel* _metaBadge;        // "CTRL" indicator, created lazily
     CSymbolPanel* _symPanel;   // Term50 symmenu grid, created lazily
     bool          _imeOn;      // pinyin input active (Alt+Enter toggles)
+    qint64        _imeCommitMs; // when the last commit landed (repeat guard)
     cjk_ime_t*    _ime;        // pinyin engine, created lazily
     CImePanel*    _imePanel;   // candidate strip, created lazily
+    int           _bottomReserve; // pixels kept free under the last row
+    bool          _suppressSizeHint; // no "Size: 80 x 22" box for our own resizes
     QString       _imeRaw;     // letters as typed (case kept), flushed by Enter
     QLabel*       _imeBadge;   // "中" indicator while the IME is on
+    CKeyBar*      _keyBar;     // custom key strip, created lazily
+    bool          _keyBarOn;   // strip visible (QSettings KeyBarOn)
+    void refreshBottomReserve();   // strip heights -> pty rows
     CCommandPanel* _cmdPanel;  // quick commands / ssh hosts, created lazily
     QString       _sshPendingPwd; // password waiting for the ssh prompt
     QString       _sshTail;       // last output chars, catches split prompts
     QTimer*       _sshPwdTimer;   // gives up waiting after a while
+    int           _sshPwdTries;   // how many times we already typed it
     void sendPastedText(const QString &text);   // the actual paste, after the guard
 
     // -- dropped connection ----------------------------------------------
@@ -788,7 +859,9 @@ private:
     QString       _lastSshPassword;
     int           _lastSshPort;
     QString       _dcTail;          // recent output, scanned for ssh farewells
+    QString       _sshTailForDiag;  // same, but watched for "permission denied"
     bool          _dcShown;         // banner already up, do not re-detect
+    bool          _sshDiagShown;    // already dumped the ssh -v tail once
     QWidget*      _dcBanner;        // "连接已断开 / 重连", created lazily
     QLabel*       _dcLabel;
     void buildDisconnectBanner();
@@ -800,7 +873,9 @@ private:
     QTimer*       _tsLongTimer;   // fires when a finger stays put
     int           _tsMode;        // 0 none, 1 one finger, 2 two fingers
     bool          _tsMoved;       // the single finger travelled too far for a tap
-    bool          _tsLongFired;   // long press already selected + opened the menu
+    bool          _tsLongFired;   // the hold was recognised, a drag now extends the selection
+    int           _tsLongStage;   // 0 idle, 1 line lit, 2 menu opened by the timer
+    bool          _tsMenuShown;   // the hold timer already opened the menu
     QPoint        _tsStart;       // where the finger came down
     qreal         _tsPinchBase;   // finger distance when the pinch started
     int           _tsPinchPx;     // font pixel size at that moment
@@ -809,11 +884,21 @@ private:
     qreal         _tsBaseY;       // average finger Y when the gesture started
     qreal         _tsLastY;       // average finger Y at the previous move
     qreal         _tsScrollAcc;   // sub-line scrolling remainder
+    bool          _tsTouching;    // a finger is on the screen right now
+    bool          _tsScrolling;   // the single finger is dragging the scrollback
+    qreal         _tsDragLastY;   // finger Y at the previous move, drag-to-scroll
+    qint64        _tsLastTapMs;   // when the previous tap lifted, for double tap
+    QPoint        _tsLastTapPos;  // where that tap was, so a far one is not a pair
     void selectLineAt( const QPoint& pos, int* absLine );
+    void selectWordAt( const QPoint& pos );
     void extendTouchSelection( const QPoint& pos );
     void showTouchMenu( const QPoint& pos );
     void copySelectionToClipboard();
+    void sendCtrlKey(QKeyEvent* event);   // Ctrl+<key> for the meta layer
     void handleMetaKey(QKeyEvent* event);
+    // Alternate screen (vi/less/top/claude/pi ...) has no local history, so
+    // a drag or wheel there is forwarded to the application.
+    bool scrollAlternateScreen(int lines);
 
 //    KMenu* _drop;
     QString _dropText;
@@ -859,12 +944,21 @@ private:
     };
     InputMethodData _inputMethodData;
 
+    // pty of the tab this display belongs to (see setInputSession)
+    CShellSession *_inputSession;
+
     static bool _antialiasText;   // do we antialias or not
 
     //the delay in milliseconds between redrawing blinking text
     static const int BLINK_DELAY = 500;
 	static const int DEFAULT_LEFT_MARGIN = 1;
 	static const int DEFAULT_TOP_MARGIN = 1;
+	// The grid is height/fontHeight rows, so whatever is left over piles up
+	// under the last row.  On 720x720 that remainder is one pixel, which puts
+	// the cursor block straight against the key strip - and it changes when
+	// the strip comes and goes, so the gap looked random.  A constant pad makes
+	// the worst case a design value instead of an accident of the screen size.
+	static const int DEFAULT_BOTTOM_PAD = 6;
 
 public:
     static void setTransparencyEnabled(bool enable)
