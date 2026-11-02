@@ -1,0 +1,53 @@
+=== whoami/host ===
+root
+WIN-20240221TCO
+Linux WIN-20240221TCO 6.18.40.1-microsoft-standard-WSL2 #1 SMP PREEMPT_DYNAMIC Fri Jul 31 22:12:15 UTC 2026 x86_64 x86_64 x86_64 GNU/Linux
+=== repo ===
+/root/q30-term50-kit/src/BGShellBB10
+true
+/root/q30-term50-kit/src/BGShellBB10
+--- remote ---
+origin	https://github.com/chnak/BGShellBB10.git (fetch)
+origin	https://github.com/chnak/BGShellBB10.git (push)
+--- branch ---
+* main
+  remotes/origin/main
+--- HEAD ---
+8a11375 sdf
+710ebff sdf
+35bd754 sdf
+--- status count ---
+87
+=== gh cli ===
+gh: NOT INSTALLED
+=== token env ===
+GITHUB_TOKEN=EMPTY
+GH_TOKEN=EMPTY
+GITHUB_PAT=EMPTY
+=== credential files ===
+no ~/.git-credentials
+no credential.helper
+=== network to github ===
+api.github.com http=200 time=0.286325
+=== repo exists? ===
+{
+  "id": 1426608418,
+  "node_id": "R_kgDOVQhRIg",
+  "name": "BGShellBB10",
+  "full_name": "chnak/BGShellBB10",
+  "private": false,
+  "owner": {
+    "login": "chnak",
+    "id": 791734,
+    "node_id": "MDQ6VXNlcjc5MTczNA==",
+    "avatar_url": "https://avatars.githubusercontent.com/u/791734?v=4",
+    "gravatar_id": "",
+    "url": "https://api.github.com/users/chnak",
+    "html_url": "https://github.com/chnak",
+    "followers_url": "https://api.github.com/users/chnak/followers",
+    "following_url": "https://api.github.com/users/chnak/following{/other_user}",
+    "gists_url": "https://api.github.
+=== bar files ===
+-rw-r--r-- 1 root root 8500645 Oct 27 11:34 /root/q30-term50-kit/src/BGShellBB10/BGShellBB10.bar
+-rw-r--r-- 1 root root 28787308 Oct 20 11:56 /root/q30-term50-kit/Term50.bar
+=== DONE ===
