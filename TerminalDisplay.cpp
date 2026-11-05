@@ -26,6 +26,7 @@
 
 // Own
 #include "TerminalDisplay.h"
+#include "bgshelldirs.h"
 
 // Hold timings for the copy/paste gesture. The line lights up first, so the
 // finger gets an answer straight away; the menu then opens by itself instead
@@ -64,7 +65,7 @@ static void rlog(const char* what, int a = 0, int b = 0)
   if (n > 200)
     return;
   ++n;
-  QFile f(QDir::current().absoluteFilePath(QString::fromLatin1("data/render.log")));
+  QFile f(bgshellDataPath(QString::fromLatin1("data/render.log")));
   if (!f.open(QIODevice::WriteOnly | QIODevice::Append))
     return;
   QTextStream ts(&f);
@@ -1924,7 +1925,7 @@ static bool imeLogLine(const QString& line)
 	if (n > 800)
 		return false;
 	++n;
-	QFile f(QDir::current().absoluteFilePath(QString::fromLatin1("data/imekey.log")));
+	QFile f(bgshellDataPath(QString::fromLatin1("data/imekey.log")));
 	if (!f.open(QIODevice::WriteOnly | QIODevice::Append))
 		return false;
 	QTextStream ts(&f);
@@ -2085,7 +2086,7 @@ static void tsTrace(const char* what, int a = 0, int b = 0)
   if (n > 300)
     return;
   ++n;
-  QFile f(QDir::current().absoluteFilePath(QString::fromLatin1("data/touchdrag.log")));
+  QFile f(bgshellDataPath(QString::fromLatin1("data/touchdrag.log")));
   if (!f.open(QIODevice::WriteOnly | QIODevice::Append))
     return;
   QTextStream ts(&f);
@@ -3701,7 +3702,7 @@ void TerminalDisplay::runSshConnection(const QString &user, const QString &host,
     // it, so fall back to plain "no" and keep our own known_hosts file.
     const bool acceptNew = (gSshMajor > 7) || (gSshMajor == 7 && gSshMinor >= 6);
     const QString knownHosts =
-        QDir::current().absoluteFilePath(QString("data/.ssh/known_hosts"));
+        bgshellDataPath(QString("data/.ssh/known_hosts"));
 
     // Reading the password off /dev/tty is the fragile part: the sandbox does
     // not always hand a controlling terminal to the child, and when it fails
@@ -3710,9 +3711,9 @@ void TerminalDisplay::runSshConnection(const QString &user, const QString &host,
     // the secret through a helper program instead, so the prompt is optional.
     QString askpassPrefix;
     const QString askpassPass =
-        QDir::current().absoluteFilePath(QString("data/.ssh/askpass.pass"));
+        bgshellDataPath(QString("data/.ssh/askpass.pass"));
     if (!password.isEmpty()) {
-        const QString sshDir = QDir::current().absoluteFilePath(QString("data/.ssh"));
+        const QString sshDir = bgshellDataPath(QString("data/.ssh"));
         QDir().mkpath(sshDir);
         const QString shFile = sshDir + "/askpass.sh";
 
@@ -3754,7 +3755,7 @@ void TerminalDisplay::runSshConnection(const QString &user, const QString &host,
     QString libPrefix;
     {
         const QString bundled =
-            QDir::current().absoluteFilePath(QString("app/native/bin/ssh"));
+            QCoreApplication::applicationDirPath() + QString("/bin/ssh");
         const QString bundledLib =
             QDir::current().absoluteFilePath(QString("app/native/lib"));
         if (!password.isEmpty() && QFile::exists(bundled)) {
@@ -3767,7 +3768,7 @@ void TerminalDisplay::runSshConnection(const QString &user, const QString &host,
     // trace of what the authentication phase actually tried; a bare
     // "Permission denied" carries no information at all.
     const QString sshLog =
-        QDir::current().absoluteFilePath(QString("data/ssh.log"));
+        bgshellDataPath(QString("data/ssh.log"));
     if (QFileInfo(sshLog).size() > 262144)
         QFile::remove(sshLog);
 
@@ -3794,8 +3795,14 @@ void TerminalDisplay::runSshConnection(const QString &user, const QString &host,
         QString key = identity;
         // Relative paths are written the way the user thinks of them
         // ("data/.ssh/id_rsa"); ssh would resolve them against its own cwd.
-        if (QFileInfo(key).isRelative())
-            key = QDir::current().absoluteFilePath(key);
+        if (QFileInfo(key).isRelative()) {
+            // "data/..." means the persistent directory; anything else is
+            // relative to the application folder.
+            if (key.startsWith(QLatin1String("data")))
+                key = bgshellDataPath(key);
+            else
+                key = QDir::current().absoluteFilePath(key);
+        }
         QFile kf(key);
         if (kf.exists()) {
             // ssh silently refuses keys anyone else can read.
@@ -3860,7 +3867,7 @@ void TerminalDisplay::clearPendingSshPassword()
 	// The askpass helper has a second reason to exist after this: leaving the
 	// plaintext password on the flash for the rest of the session is not worth
 	// a feature nobody is using any more.
-	QFile::remove(QDir::current().absoluteFilePath(QString("data/.ssh/askpass.pass")));
+	QFile::remove(bgshellDataPath(QString("data/.ssh/askpass.pass")));
 }
 
 // ---------------------------------------------------------------------------
@@ -3960,7 +3967,7 @@ void TerminalDisplay::onDisconnectDismiss()
 
 void TerminalDisplay::showSshDiagnostics()
 {
-	const QString log = QDir::current().absoluteFilePath(QString("data/ssh.log"));
+	const QString log = bgshellDataPath(QString("data/ssh.log"));
 	if (!QFile::exists(log))
 		return;
 	// Typed at the prompt on purpose: the user is looking at that spot, and the

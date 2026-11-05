@@ -45,6 +45,7 @@ int gSshMinor = 0;
 #include "mydevicetype.h"
 #include "cshell.h"
 #include "csessiontabs.h"
+#include "bgshelldirs.h"
 
 // Headers for trackpad event handling
 #include <screen/screen.h>
@@ -395,24 +396,6 @@ void bgshellApplyFont()
     }
 }
 
-// Qt 4 has no QDir::removeRecursively(), so this does it by hand.
-static void bgshellRemoveTree(const QString &path)
-{
-    QDir dir(path);
-    if (!dir.exists())
-        return;
-    const QFileInfoList entries =
-        dir.entryInfoList(QDir::Files | QDir::Dirs | QDir::Hidden | QDir::NoDotAndDotDot);
-    for (int i = 0; i < entries.size(); ++i) {
-        const QFileInfo &e = entries.at(i);
-        if (e.isDir())
-            bgshellRemoveTree(e.absoluteFilePath());
-        else
-            QFile::remove(e.absoluteFilePath());
-    }
-    QDir().rmdir(path);
-}
-
 // Copy a directory tree, skipping anything that already exists at the
 // destination - this only ever fills in what is missing.
 static void bgshellCopyTree(const QString &from, const QString &to)
@@ -434,22 +417,10 @@ static void bgshellCopyTree(const QString &from, const QString &to)
     }
 }
 
-// Persistent data lives in the shared folder, not in the app sandbox.
-//
-// Everything the app remembers - settings, saved SSH hosts, keys, known_hosts,
-// the hex logs - is written under "data/" relative to the working directory,
-// which is appdata/<app id>/data.  That directory is deleted when the bar is
-// reinstalled, so every update used to wipe the user's setup.
-//
-// Here "data" is turned into a symlink to /accounts/1000/shared/bgshell, which
-// survives a reinstall.  Anything already in the sandbox is copied over first,
-// and if the shared folder cannot be written (no access_shared permission) the
-// app simply keeps using the sandbox - it never fails to start.
 // Pick the first place outside the sandbox that this app can actually write.
-// /accounts/1000/shared itself is group writable but refuses mkdir even for
-// the shared group, so the writable spots are its "misc" subfolder and the
-// SD card.  The sandbox is the last resort - it works, it just does not
-// survive a reinstall.
+// /accounts/1000/shared itself refuses mkdir even for the shared group, so the
+// writable spots are its "misc" subfolder and the SD card.  The sandbox is the
+// last resort - it works, it just does not survive a reinstall.
 static QString bgshellPickDataRoot()
 {
     static const char *candidates[] = {
@@ -473,46 +444,31 @@ static QString bgshellPickDataRoot()
     return QString();
 }
 
+// Persistent data lives in the shared folder, not in the app sandbox.
+//
+// Everything the app remembers - settings, saved SSH hosts, keys, known_hosts,
+// the hex logs - is written under "data/" relative to the working directory,
+// which is appdata/<app id>/data.  That directory is deleted when the bar is
+// reinstalled, so every update used to wipe the user's setup.
+//
+// The "data" entry itself cannot be turned into a symlink: the app is not the
+// owner of its appdata directory, so a rename or unlink there fails with
+// "Permission denied" (verified on the device).  Instead the persistent root
+// is picked here and every "data/..." path goes through bgshellDataPath().
 static void bgshellSetupDataDir(const QString &cwd)
 {
-    const QString dataLink = cwd + "/data";
-
-    const QFileInfo linkInfo(dataLink);
-    if (linkInfo.isSymLink()) {
-        // Already pointed at a persistent directory from an earlier run.
-        return;
-    }
-
     const QString sharedRoot = bgshellPickDataRoot();
     if (sharedRoot.isEmpty()) {
         qWarning() << "bgshell: no writable shared folder, keeping data in the sandbox";
         return;
     }
 
-    // Move what is already there so nothing is lost on the first update.
-    if (linkInfo.exists())
-        bgshellCopyTree(dataLink, sharedRoot);
+    // Bring anything already in the sandbox across, then make sure the
+    // subdirectories the app expects exist.
+    bgshellCopyTree(cwd + "/data", sharedRoot);
+    QDir().mkpath(sharedRoot + "/.ssh");
 
-    // The old directory has to be out of the way before the link can take its
-    // place.  Deleting it is not reliable - a file that cannot be unlinked
-    // leaves the directory behind and the link then fails (that is exactly
-    // what happened the first time).  Renaming it only needs write permission
-    // on the parent, and the leftovers stay around harmlessly.
-    if (linkInfo.exists() || QFile::exists(dataLink)) {
-        const QString aside = dataLink + ".prepersist";
-        bgshellRemoveTree(aside);
-        if (!QDir().rename(dataLink, aside)) {
-            qWarning() << "bgshell: cannot move" << dataLink << "aside, keeping the sandbox";
-            return;
-        }
-        qDebug() << "bgshell: old data moved to" << aside;
-    }
-
-    if (!QFile::link(sharedRoot, dataLink)) {
-        qWarning() << "bgshell: cannot link" << dataLink << "to" << sharedRoot;
-        QDir().mkpath(dataLink);   // keep the app usable
-        return;
-    }
+    bgshellSetDataRoot(sharedRoot);
     qDebug() << "bgshell: persistent data in" << sharedRoot;
 }
 
@@ -538,12 +494,7 @@ int main(int argc, char *argv[])
     // Must happen before anything reads data/ - settings, ssh keys and the
     // saved hosts all live there.
     bgshellSetupDataDir(QString(cwd));
-    {
-        const QFileInfo dl(QString(cwd) + "/data");
-        const QString persistent = dl.isSymLink() ? dl.symLinkTarget()
-                                                  : QString(cwd) + "/data";
-        bgshellSetupSettings(persistent);
-    }
+    bgshellSetupSettings(bgshellDataRoot());
     // ---- which ssh? -----------------------------------------------------
     // BB10 already ships OpenSSH in its read-only system partition; the app
     // also carries a bundle (ssh/scp/sftp/ssh-keygen + libcrypto/libz) under
@@ -553,7 +504,7 @@ int main(int argc, char *argv[])
     // guess falls back to the old behaviour instead of leaving no ssh at all.
     QString sshChoice("auto");
     {
-        QFile f(QString(cwd) + "/data/sshclient");
+        QFile f(bgshellDataPath(QString::fromLatin1("data/sshclient")));
         if (f.open(QIODevice::ReadOnly)) {
             const QString s = QString::fromAscii(f.readAll()).trimmed().toLower();
             if (s == "system" || s == "bundled")

@@ -15,6 +15,7 @@
 #include "qtermwidget.h"
 #include "mymainwindow.h"
 #include "mysettingswindow.h"
+#include "bgshelldirs.h"
 #include "uitheme.h"
 #include "keybar.h"
 #include "TerminalDisplay.h"
@@ -157,7 +158,7 @@ int CMySettingsWindow::Init(){
 	cbSshClient->addItem(QString::fromUtf8("应用内置"), QString("bundled"));
 	{
 		QString cur("auto");
-		QFile f(QString("data/sshclient"));
+		QFile f(bgshellDataPath(QString::fromLatin1("data/sshclient")));
 		if (f.open(QIODevice::ReadOnly)) {
 			const QString v = QString::fromAscii(f.readAll()).trimmed().toLower();
 			if (v == "system" || v == "bundled")
@@ -323,7 +324,7 @@ void CMySettingsWindow::on_cbSshClient_currentIndexChanged(const QString &){
 	if (!cb)
 		return;
 	const QString pick = cb->itemData(cb->currentIndex()).toString();
-	QFile f(QString("data/sshclient"));
+	QFile f(bgshellDataPath(QString::fromLatin1("data/sshclient")));
 	if (!f.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
 		qDebug() << "settings: cannot write data/sshclient";
 		return;

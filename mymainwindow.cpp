@@ -17,6 +17,7 @@
 
 #include "mymainwindow.h"
 #include "mysystemmenu.h"
+#include "bgshelldirs.h"
 #include "mysettingswindow.h"
 #include "qtermwidget.h"
 #include "csessiontabs.h"
@@ -33,9 +34,9 @@ void bgshellCloseSession(int index);
 // A tab whose shell ended by itself needs a different prompt from one the user
 // closed on purpose.
 void bgshellSessionEnded(int index);
-#define SSH_CONFIG_FNAME "data/.ssh/config"
-#define SSH_CONFIG_FNAME_TMP "data/.ssh/config.tmp"
-#define SSH_PROXY_AUTH_FNAME "data/.ssh/myauth"
+#define SSH_CONFIG_FNAME (bgshellDataPath(QString::fromLatin1("data/.ssh/config")))
+#define SSH_CONFIG_FNAME_TMP (bgshellDataPath(QString::fromLatin1("data/.ssh/config.tmp")))
+#define SSH_PROXY_AUTH_FNAME (bgshellDataPath(QString::fromLatin1("data/.ssh/myauth")))
 
 CMyMainWindow::CMyMainWindow() :
 	QMainWindow(),
@@ -217,7 +218,7 @@ void CMyMainWindow::ReadAndApplyProxySettings(){
     netstatus_free_proxy_details(&details);
 
     QDir SshDir(QString("data"));
-    QDir SshDir1(QString("data/.ssh"));
+    QDir SshDir1(bgshellDataPath(QString::fromLatin1("data/.ssh")));
     if (!SshDir1.exists())
     	if (!SshDir.mkdir(".ssh"))
     		qDebug() << "CMyMainWindow::ReadAndApplyProxySettings(): Can't create data/.ssh";
@@ -243,7 +244,7 @@ void CMyMainWindow::ReadAndApplyProxySettings(){
 		    	fileSshProxyAuth.setPermissions(QFile::ReadOwner | QFile::WriteOwner);
 		    	proxycommand = "\tProxyCommand corkscrew " + host + " " + port + " %h %p ~/.ssh/myauth\n";
 		    }else{
-				qDebug() << QString("CMyMainWindow::ReadAndApplyProxySettings(): can't open ") + QString(SSH_PROXY_AUTH_FNAME) + QString(" for writing");
+				qDebug() << QString("CMyMainWindow::ReadAndApplyProxySettings(): can't open ") + SSH_PROXY_AUTH_FNAME + QString(" for writing");
 				proxycommand = "\tProxyCommand corkscrew " + host + " " + port + " %h %p\n";
 		    }
 		}
@@ -251,12 +252,12 @@ void CMyMainWindow::ReadAndApplyProxySettings(){
 		if (fileSshConfig.exists()){
 			// file does exist
 			if (!fileSshConfig.open(QIODevice::ReadOnly)){
-				qDebug() << QString("CMyMainWindow::ReadAndApplyProxySettings(): can't open ") + QString(SSH_CONFIG_FNAME) + QString(" for reading");
+				qDebug() << QString("CMyMainWindow::ReadAndApplyProxySettings(): can't open ") + SSH_CONFIG_FNAME + QString(" for reading");
 				return;
 			}
 			QFile fileSshConfigTmp(SSH_CONFIG_FNAME_TMP);
 			if (!fileSshConfigTmp.open(QIODevice::WriteOnly)){
-				qDebug() << QString("CMyMainWindow::ReadAndApplyProxySettings(): can't open ") + QString(SSH_CONFIG_FNAME_TMP) + QString(" for writing");
+				qDebug() << QString("CMyMainWindow::ReadAndApplyProxySettings(): can't open ") + SSH_CONFIG_FNAME_TMP + QString(" for writing");
 				fileSshConfig.close();
 				return;
 			}
@@ -309,7 +310,7 @@ void CMyMainWindow::ReadAndApplyProxySettings(){
 		}else{
 			// file does not exist, let's create it
 			if (!fileSshConfig.open(QIODevice::WriteOnly)){
-				qDebug() << QString("CMyMainWindow::ReadAndApplyProxySettings(): can't open ") + QString(SSH_CONFIG_FNAME) + QString(" for writing");
+				qDebug() << QString("CMyMainWindow::ReadAndApplyProxySettings(): can't open ") + SSH_CONFIG_FNAME + QString(" for writing");
 				return;
 			}
 			fileSshConfig.write("Host *\n");
@@ -327,12 +328,12 @@ void CMyMainWindow::ReadAndApplyProxySettings(){
 		if (fileSshConfig.exists()){
 			// file does exist, let's make sure that there is no proxy for Host *
 			if (!fileSshConfig.open(QIODevice::ReadOnly)){
-				qDebug() << QString("CMyMainWindow::ReadAndApplyProxySettings(): can't open ") + QString(SSH_CONFIG_FNAME) + QString(" for reading");
+				qDebug() << QString("CMyMainWindow::ReadAndApplyProxySettings(): can't open ") + SSH_CONFIG_FNAME + QString(" for reading");
 				return;
 			}
 			QFile fileSshConfigTmp(SSH_CONFIG_FNAME_TMP);
 			if (!fileSshConfigTmp.open(QIODevice::WriteOnly)){
-				qDebug() << QString("CMyMainWindow::ReadAndApplyProxySettings(): can't open ") + QString(SSH_CONFIG_FNAME_TMP) + QString(" for writing");
+				qDebug() << QString("CMyMainWindow::ReadAndApplyProxySettings(): can't open ") + SSH_CONFIG_FNAME_TMP + QString(" for writing");
 				fileSshConfig.close();
 				return;
 			}

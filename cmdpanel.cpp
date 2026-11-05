@@ -20,6 +20,7 @@
 #include <QtGui/QFontMetrics>
 
 #include "cmdpanel.h"
+#include "bgshelldirs.h"
 #include "uitheme.h"
 
 namespace {
@@ -235,7 +236,7 @@ void CCommandPanel::buildUi()
 	                   QString::fromUtf8("22"), &_edPortLabel);
 
 	_edKey = addField(form, _editor, QString::fromUtf8("私钥（可选）"),
-	                  QString::fromUtf8("data/.ssh/id_rsa"), &_edKeyLabel);
+	                  bgshellDataPath(QString::fromUtf8("data/.ssh/id_rsa")), &_edKeyLabel);
 
 	_edPassword = addField(form, _editor, QString::fromUtf8("密码（可选）"),
 	                       QString::fromUtf8("留空则用密钥 / 手动输入"),
