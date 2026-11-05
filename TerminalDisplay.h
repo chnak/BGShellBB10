@@ -813,7 +813,8 @@ private:
     int  _paintedUpdate;     // value of _imgUpdates at the last paintEvent
     int  _watchdogTries;     // consecutive watchdog attempts that changed nothing
     bool _inPaint;           // inside paintEvent()/forceRepaintNow()
-    int  _forceCount;        // direct QPainter paints of the backing store
+    int  _forceCount;        // forced repaints attempted
+    qint64 _lastForceLogMs;  // rate-limits the "force-dropped" log line
     qint64 _lastIdleProbeMs; // last paint-channel liveness probe (full repaint)
     qint64 _lastTickMs;      // watchdog clock, detects a stalled UI thread
     bool _cursorBlinking;     // hide cursor in paintEvent

@@ -10,6 +10,7 @@
 #include "qtermwidget.h"
 #include "mysystemmenu.h"
 #include "mysettingswindow.h"
+#include "mymainwindow.h"
 #include "uitheme.h"
 
 CMySystemMenu::CMySystemMenu(QWidget *parent) :
@@ -36,9 +37,14 @@ int CMySystemMenu::MenuInit(){
 	btnCmds->setText(QString::fromUtf8("命令 / SSH"));
 	btnCmds->setFocusPolicy(Qt::NoFocus);
 
-	QToolButton *both[2] = { btnSettings, btnCmds };
-	for (int i = 0; i < 2; ++i) {
-		both[i]->setStyleSheet(QString(
+	btnQr = new QToolButton(this);
+	btnQr->setObjectName(QString::fromUtf8("btnQr"));
+	btnQr->setText(QString::fromUtf8("扫二维码"));
+	btnQr->setFocusPolicy(Qt::NoFocus);
+
+	QToolButton *all[3] = { btnSettings, btnCmds, btnQr };
+	for (int i = 0; i < 3; ++i) {
+		all[i]->setStyleSheet(QString(
 		    "QToolButton { background-color: transparent; border: none;"
 		    "  color: %1; font-size: 27px; padding: 0px 0px 0px 22px;"
 		    "  text-align: left; }"
@@ -65,13 +71,14 @@ void CMySystemMenu::SetGeometry(){
 	const int nRowH = 92;
 	const int nPad  = 10;
 	const int nGap  = 8;
-	const int nH    = nPad * 2 + nRowH * 2 + nGap;
+	const int nH    = nPad * 2 + nRowH * 3 + nGap * 2;
 
 	this->setGeometry(nScreenWidth - nW - 12, 54, nW, nH);
 
 	const int nBtnW = nW - 2 * nPad;
 	btnSettings->setGeometry(QRect(nPad, nPad, nBtnW, nRowH));
 	btnCmds    ->setGeometry(QRect(nPad, nPad + nRowH + nGap, nBtnW, nRowH));
+	btnQr      ->setGeometry(QRect(nPad, nPad + (nRowH + nGap) * 2, nBtnW, nRowH));
 }
 
 void CMySystemMenu::paintEvent(QPaintEvent *)
@@ -94,10 +101,12 @@ void CMySystemMenu::paintEvent(QPaintEvent *)
 	p.setPen(QPen(UiTheme::Accent, 2));
 	p.drawLine(radius, 1, width() - radius, 1);
 
-	// Divider between the two entries.
+	// Divider between the entries.
 	p.setPen(QPen(QColor(43, 53, 64, 200), 1));
-	const int y = btnSettings->geometry().bottom() + 4;
-	p.drawLine(16, y, width() - 16, y);
+	const int y1 = btnSettings->geometry().bottom() + 4;
+	p.drawLine(16, y1, width() - 16, y1);
+	const int y2 = btnCmds->geometry().bottom() + 4;
+	p.drawLine(16, y2, width() - 16, y2);
 }
 
 void CMySystemMenu::on_btnSettings_clicked(){
@@ -113,4 +122,13 @@ void CMySystemMenu::on_btnCmds_clicked(){
 	extern QTermWidget *console;
 	if (console)
 		console->toggleCommandPanel();
+}
+
+// The scanner is a full-screen overlay, so the card gets out of the way
+// first and the overlay is raised above the terminal and the tab strip.
+void CMySystemMenu::on_btnQr_clicked(){
+	hide();
+	extern CMyMainWindow *mainWindow;
+	if (mainWindow)
+		mainWindow->sessionQrScan();
 }

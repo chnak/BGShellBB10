@@ -36,7 +36,11 @@
     </icon>
     <asset path="assets/BGshellPlus_icon144x144.png">BGshellPlus_icon144x144.png</asset>
     <asset path="assets">assets</asset>
-    
+    <!-- The QR scanner helper.  The camera on BB10 can only be opened from a
+         Cascades application, and this app is a plain Qt Widgets program, so
+         the camera runs in its own process.  Built by build-helper.sh. -->
+    <asset path="arm/o.le-v7/bgqrcam" type="Qnx/Elf">bin/bgqrcam</asset>
+
 	<initialWindow>
 		<aspectRatio>portrait</aspectRatio>
 		<autoOrients>false</autoOrients>
@@ -66,5 +70,7 @@
     <permission>access_internet</permission>
     <permission>access_shared</permission>
     <permission>run_when_backgrounded</permission>
+    <!-- The QR scanner opens the rear camera. -->
+    <permission>camera</permission>
 	<env var="LD_LIBRARY_PATH" value="app/native/lib:/usr/lib/qt4/lib"/>
 </qnx>

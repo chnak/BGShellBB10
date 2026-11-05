@@ -5,6 +5,8 @@
 #define MYMAINWINDOW_H
 #include <QtGui/QMainWindow>
 
+class CMyQrScanner;
+
 class CMyMainWindow : public QMainWindow
 {
 	Q_OBJECT
@@ -26,6 +28,13 @@ public slots:
     void sessionTitleChanged(const QString &title);
     // Show / dismiss the settings card (gear at the right of the tab strip).
     void sessionMenu();
+    // Open the QR scanner (same card, "扫二维码" entry).
+    void sessionQrScan();
+    // The scanner found a code: it is on the clipboard already.
+    void qrScanned(const QString &text);
+    // The scanner found a code and the user asked for it to be typed into
+    // the shell.
+    void qrInsert(const QString &text);
 
 protected:
     // QEvent::PlatformPanel only arrives for the swipe-DOWN edge gesture, so
@@ -36,6 +45,10 @@ private:
     int  _menuDownY;     // screen Y where the current touch started
     bool _menuTracking;  // that touch began while the card was open
     bool _menuSwallow;   // ...it landed on the terminal: eat the whole gesture
+
+    // The QR scanner overlay.  Created on first use and kept alive, because
+    // the camera has to be released and re-taken on every open.
+    CMyQrScanner *_qrScanner;
 };
 
 #endif

@@ -4,7 +4,6 @@
 
 #include <errno.h>
 #include <fcntl.h>
-#include <poll.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -180,27 +179,15 @@ void CShellSession::onReadable()
 			continue;
 		}
 		if (n == 0) {
-			// slave side gone
-			reap();
-			if (!_dead) {
-				_dead = true;
-				emit finished();
-			}
+			// EOF - the shell exited (exit, Ctrl-D, ssh dropped).
+			_dead = true;
 			closeFd();
+			emit finished();
 			return;
 		}
 		if (errno == EINTR)
 			continue;
-		if (errno == EAGAIN || errno == EWOULDBLOCK)
-			return;
-		// EIO on Linux, EBADF on QNX once the child is gone
-		reap();
-		if (!_dead) {
-			_dead = true;
-			emit finished();
-		}
-		closeFd();
-		return;
+		return;   // EAGAIN: nothing more right now
 	}
 }
 
@@ -218,28 +205,34 @@ void CShellSession::send(const char *data, int len)
 		}
 		if (n < 0 && errno == EINTR)
 			continue;
-		if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-			// Master buffer full: wait for the shell to read instead of
-			// dropping the rest.  A dropped tail is a half-typed command,
-			// which is far worse than a 20 ms stall.  Give up only after
-			// a quarter of a second of no room at all.
-			static const int kBudgetMs = 250;
-			static const int kSliceMs  = 20;
-			int waited = 0;
-			while (waited < kBudgetMs) {
-				struct pollfd pfd;
-				pfd.fd = _fd;
-				pfd.events = POLLOUT;
-				pfd.revents = 0;
-				if (::poll(&pfd, 1, kSliceMs) > 0)
-					break;
-				waited += kSliceMs;
-			}
-			if (waited >= kBudgetMs)
-				return;
-			continue;
-		}
+		// A full or closed pty must not block the UI thread; whatever did
+		// not fit is dropped.
+		break;
+	}
+}
+
+void CShellSession::hangup()
+{
+	if (_pid > 0) {
+		::kill(_pid, SIGHUP);
+		_pid = -1;
+	}
+	_dead = true;
+	closeFd();
+}
+
+void CShellSession::reap()
+{
+	if (_pid <= 0)
 		return;
+
+	int status = 0;
+	const pid_t r = ::waitpid(_pid, &status, WNOHANG);
+	if (r == _pid || (r < 0 && errno == ECHILD)) {
+		_pid  = -1;
+		_dead = true;
+		closeFd();
+		emit finished();
 	}
 }
 
@@ -259,35 +252,3 @@ void CShellSession::setWindowSize(int cols, int rows)
 	ioctl(_fd, TIOCSWINSZ, &ws);
 }
 
-void CShellSession::hangup()
-{
-	if (_pid > 0) {
-		kill(_pid, SIGHUP);
-		kill(_pid, SIGTERM);
-		reap();
-		// A shell that traps HUP/TERM would otherwise stay behind for good,
-		// still holding the slave side of a pty nobody reads any more.
-		if (_pid > 0) {
-			kill(_pid, SIGKILL);
-			reap();
-		}
-	}
-	_dead = true;
-	closeFd();
-}
-
-// Reap the child if it is already gone.  Nothing else in the app waits for
-// our pids - k3processcontroller only knows the processes it started itself -
-// so without this every tab whose shell exits (exit / Ctrl-D) or is closed
-// leaks one zombie into the process table, and they accumulate for the life of
-// the app.
-void CShellSession::reap()
-{
-	if (_pid <= 0)
-		return;
-
-	int status = 0;
-	const pid_t r = ::waitpid(_pid, &status, WNOHANG);
-	if (r == _pid || (r < 0 && errno == ECHILD))
-		_pid = -1;
-}

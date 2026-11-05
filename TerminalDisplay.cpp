@@ -345,6 +345,7 @@ TerminalDisplay::TerminalDisplay(QWidget *parent)
 ,_watchdogTries(0)
 ,_inPaint(false)
 ,_forceCount(0)
+,_lastForceLogMs(0)
 ,_lastIdleProbeMs(0)
 ,_lastTickMs(0)
 ,_ctrlDrag(false)
@@ -909,17 +910,28 @@ void TerminalDisplay::scrollImage(int lines , const QRect& screenWindowRegion)
                       this->_columns *
                       sizeof(Character);
 
-    Q_ASSERT( linesToMove > 0 );
-    Q_ASSERT( bytesToMove > 0 );
+    if ( linesToMove <= 0 || bytesToMove <= 0 )
+        return;
+
+    // Memory-safety guard.  These were Q_ASSERTs, which meant a debug build
+    // aborted the whole process and a release build would memmove() past the
+    // end of the image.  While a program is redrawing, the screen window and
+    // _image can disagree for one tick; skipping the scroll is harmless because
+    // the caller repaints the affected rows from scratch straight afterwards.
+    {
+        const char *imageBegin = (const char*)_image;
+        const char *imageEnd   = (const char*)(_image + _imageSize);
+        const char *firstPos   = (const char*)firstCharPos;
+        const char *lastPos    = (const char*)lastCharPos;
+        if (firstPos < imageBegin || lastPos < imageBegin
+            || firstPos + bytesToMove > imageEnd
+            || lastPos  + bytesToMove > imageEnd)
+            return;
+    }
 
     //scroll internal image
     if ( lines > 0 )
     {
-        // check that the memory areas that we are going to move are valid
-        Q_ASSERT( (char*)lastCharPos + bytesToMove < 
-                  (char*)(_image + (this->_lines * this->_columns)) );
-        
-        Q_ASSERT( (lines*this->_columns) < _imageSize ); 
 
         //scroll internal image down
         memmove( firstCharPos , lastCharPos , bytesToMove ); 
@@ -940,9 +952,7 @@ void TerminalDisplay::scrollImage(int lines , const QRect& screenWindowRegion)
     }
     else
     {
-        // check that the memory areas that we are going to move are valid
-        Q_ASSERT( (char*)firstCharPos + bytesToMove < 
-                  (char*)(_image + (this->_lines * this->_columns)) );
+        // bounds already validated above (see the guard before the branch)
 
         //scroll internal image up
         memmove( lastCharPos , firstCharPos , bytesToMove ); 
@@ -1035,8 +1045,15 @@ void TerminalDisplay::updateImage()
   if (!_image)
      updateImageSize(); // Create _image
 
-  Q_ASSERT( this->_usedLines <= this->_lines );
-  Q_ASSERT( this->_usedColumns <= this->_columns );
+  // A resize can land between makeImage() and here, leaving _usedLines /
+  // _usedColumns describing the previous (larger) grid for one tick.  This
+  // used to be a Q_ASSERT pair: in the shipped debug build the mismatch called
+  // abort() and took the whole application down while a program was redrawing
+  // continuously - which is exactly what a full-screen TUI does.  The values
+  // are recomputed a few lines below anyway, so clamping is both safe and
+  // sufficient; it must never be fatal.
+  _usedLines   = qBound(0, _usedLines,   qMax(0, _lines));
+  _usedColumns = qBound(0, _usedColumns, qMax(0, _columns));
 
   int y,x,len;
 
@@ -1771,36 +1788,56 @@ void TerminalDisplay::refreshWatchdog()
   }
 }
 
-// Paints the whole widget straight into its backing store.  update() and
-// repaint() both bail out when the platform claims the widget is not visible;
-// constructing a QPainter on the widget does not consult that answer at all,
-// which makes this the one path that cannot be silently swallowed.
+// Forces the widget to paint right now.
+//
+// The old implementation constructed `QPainter paint(this)` here.  On a widget
+// that is not inside paintEvent() Qt4 refuses to hand out a paint engine, so
+// every call produced the pair of warnings below and then did nothing at all
+// (paint.isActive() was false, so the body was skipped):
+//
+//   QWidget::paintEngine: Should no longer be called
+//   QPainter::begin: Paint device returned engine == 0, type: 1
+//
+// Worse, going straight at the backing store from a timer while the Cascades
+// window system was mid-frame is what produces
+// `QBBWindow: failed to post window buffer, errno=16` (EBUSY) - that message
+// was the last thing the process logged before it died.
+//
+// repaint() is synchronous and paints through the normal paintEvent() path,
+// which is the only place a widget is supposed to be painted.
 void TerminalDisplay::forceRepaintNow()
 {
   if (_inPaint || !_image || _usedColumns <= 0 || _usedLines <= 0)
       return;
 
+  if (!isVisible())
+      return;
+
   _inPaint = true;
   QTime forceClock;
   forceClock.start();
-  QPainter paint(this);
-  if (paint.isActive())
+
+  ++_forceCount;
+  const int before = _paintedUpdate;
+  repaint(contentsRect());
+  if (_paintedUpdate == before)
   {
-      drawBackground(paint, contentsRect(), palette().background().color(), true);
-      for (int y = 0; y < _usedLines; y++)
-          drawContents(paint, rowRect(y));
-      drawInputMethodPreeditString(paint, preeditRect());
-      paintFilters(paint);
-      paint.end();
-      ++_forceCount;
-      _paintedUpdate = _imgUpdates;
-      memcpy(_snapshot, _image, _usedLines * _columns * sizeof(Character));
-      _snapshotValid = true;
-      const int forceMs = forceClock.elapsed();
-      if (forceMs > 15)
-          rlog("force-ms", forceMs, 0);
+      // The platform dropped it again.  Do NOT pretend we caught up - that
+      // would leave the screen permanently stale.  The watchdog retries on its
+      // next tick; the timestamp only keeps the log readable.
+      const qint64 now = QDateTime::currentMSecsSinceEpoch();
+      if (now - _lastForceLogMs > 1000)
+      {
+          _lastForceLogMs = now;
+          rlog("force-dropped", _imgUpdates, before);
+      }
   }
+
   _inPaint = false;
+
+  const int forceMs = forceClock.elapsed();
+  if (forceMs > 15)
+      rlog("force-ms", forceMs, 0);
 }
 
 int TerminalDisplay::textOriginX() const
@@ -4670,10 +4707,14 @@ void TerminalDisplay::makeImage()
 //qDebug("%s %d makeImage", __FILE__, __LINE__);
   calcGeometry();
 
-  // confirm that array will be of non-zero size, since the painting code 
-  // assumes a non-zero array length
-  Q_ASSERT( _lines > 0 && _columns > 0 );
-  Q_ASSERT( _usedLines <= _lines && _usedColumns <= _columns );
+  // The painting code assumes a non-zero array length, and _usedLines /
+  // _usedColumns must never point past the grid.  These were Q_ASSERTs, so a
+  // debug build aborted the whole process on a transient zero-size layout
+  // (which happens while a window is being resized).  Enforce it instead.
+  _lines   = qMax(1, _lines);
+  _columns = qMax(1, _columns);
+  _usedLines   = qBound(0, _usedLines,   _lines);
+  _usedColumns = qBound(0, _usedColumns, _columns);
 
   _imageSize=_lines*_columns;
   

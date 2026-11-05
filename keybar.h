@@ -54,13 +54,12 @@ public:
 	void dismiss();
 	bool isOpen() const { return isVisible(); }
 
-	// Trackpad driving: delta = +1 next, -1 previous, paced like a held key.
-	void moveHighlight(int delta);
-	void commitHighlighted();
-	// True only while the trackpad highlight is "live" (moved within the last
-	// couple of seconds). Without this every trackpad click on the bottom edge
-	// would fire a button instead of acting as a click.
 	bool hasHighlight() const;
+
+	// Trackpad / arrow key driving, same pacing rules as the IME strip:
+	// delta = +1 next, -1 previous, wrapping around the items on screen.
+	void moveHighlight(int delta);
+	void commitHighlighted();      // fires the highlighted key
 
 	// The menu of keys the settings screen offers as check boxes, most used
 	// first. defaultItems() is just the first defaultCount() entries, so the

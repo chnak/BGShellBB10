@@ -53,10 +53,12 @@ signals:
 private slots:
 	void onReadable();
 
-private:
-	void closeFd();
-	/** waitpid(WNOHANG): collect the child once it is gone (no zombies). */
 	void reap();
+
+private:
+	/** Stop watching and close the master fd; the shell itself is left
+	 *  alone - hangup() is the one that kills it. */
+	void closeFd();
 
 	int               _fd;
 	int               _pid;

@@ -6,18 +6,18 @@
     modify it under the terms of the GNU Library General Public
     License as published by the Free Software Foundation; either
     version 2 of the License, or (at your option) any later version.
-		
+
     This application is distributed in the hope that it will be useful,
     but WITHOUT ANY WARRANTY; without even the implied warranty of
     MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
     Library General Public License for more details.
-				
+
     You should have received a copy of the GNU Library General Public License
     along with this library; see the file COPYING.LIB.  If not, write to
     the Free Software Foundation, Inc., 51 Franklin Street, Fifth Floor,
     Boston, MA 02110-1301, USA.
 */
-						
+
 
 #include <QtCore>
 #include <QtGui>
@@ -215,7 +215,7 @@ bool myEventFilter(void *message) {
     		}
     		if (sessionTabs)
 			sessionTabs->setGeometry(0, 0, r.width()+1, r.height()-nKBHeight);
-    		
+
 			//font = QFont(QString("Courier New"), 6);
 			font.setPixelSize(mainWindow->nFontSize);
 		    font.setStyle(QFont::StyleNormal);
@@ -469,7 +469,7 @@ int main(int argc, char *argv[])
                 chmod(tool.toAscii().data(), 0755);
         }
     }
-    
+
     // Sessions are no longer forked here: every tab owns a pty pair and a
     // login shell (see cshell.cpp).  masterFdG / slaveFdG / pidG_ stay
     // defined because the patched Konsole layer still references them, but
@@ -529,7 +529,7 @@ int main(int argc, char *argv[])
     QObject::connect(sessionTabs, SIGNAL(settingsRequested()),
                      mainWindow, SLOT(sessionMenu()));
 
-    mainWindow->show();    
+    mainWindow->show();
 
     // Install event filter
     mainEventFilter = QAbstractEventDispatcher::instance()->setEventFilter(myEventFilter);
