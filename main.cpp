@@ -493,9 +493,21 @@ static void bgshellSetupDataDir(const QString &cwd)
     if (linkInfo.exists())
         bgshellCopyTree(dataLink, sharedRoot);
 
-    if (linkInfo.isDir())
-        bgshellRemoveTree(dataLink);
-    QFile::remove(dataLink);
+    // The old directory has to be out of the way before the link can take its
+    // place.  Deleting it is not reliable - a file that cannot be unlinked
+    // leaves the directory behind and the link then fails (that is exactly
+    // what happened the first time).  Renaming it only needs write permission
+    // on the parent, and the leftovers stay around harmlessly.
+    if (linkInfo.exists() || QFile::exists(dataLink)) {
+        const QString aside = dataLink + ".prepersist";
+        bgshellRemoveTree(aside);
+        if (!QDir().rename(dataLink, aside)) {
+            qWarning() << "bgshell: cannot move" << dataLink << "aside, keeping the sandbox";
+            return;
+        }
+        qDebug() << "bgshell: old data moved to" << aside;
+    }
+
     if (!QFile::link(sharedRoot, dataLink)) {
         qWarning() << "bgshell: cannot link" << dataLink << "to" << sharedRoot;
         QDir().mkpath(dataLink);   // keep the app usable

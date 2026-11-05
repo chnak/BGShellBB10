@@ -99,6 +99,8 @@ QWidget *newHeader(QWidget *parent, const QString &title, const QString &subtitl
 
 	QLabel *t = new QLabel(title, w);
 	t->setStyleSheet(titleStyle());
+	t->setWordWrap(true);
+	t->setMinimumWidth(0);
 	l->addWidget(t);
 
 	if (!subtitle.isEmpty()) {
@@ -127,6 +129,8 @@ QFrame *newCard(QWidget *parent, const QString &title,
 	if (!title.isEmpty()) {
 		QLabel *t = new QLabel(title, card);
 		t->setStyleSheet(sectionStyle());
+		t->setWordWrap(true);
+		t->setMinimumWidth(0);
 		outer->addWidget(t);
 	}
 	if (!subtitle.isEmpty()) {
