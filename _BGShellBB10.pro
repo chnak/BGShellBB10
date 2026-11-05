@@ -6,7 +6,6 @@ CONFIG += qt thread warn_on debug_and_release cascades
 SOURCES += *.cpp
 HEADERS += *.h
 
-
 # Term50's pinyin engine (plain C, not matched by *.cpp)
 SOURCES += cjk_ime.c
 LIBS += -lbbplatform -lscreen

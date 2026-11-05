@@ -76,6 +76,10 @@ Emulation::Emulation() :
   _screen[0] = new Screen(40,80);
   _screen[1] = new Screen(40,80);
   _currentScreen = _screen[0];
+  // The alternate screen never gets a history scroll (clearHistory() and
+  // setScroll() below only touch _screen[0]), so the view has to know that
+  // dragging it cannot move anything - see scrollAlternateScreen().
+  _screen[1]->setAlternateScreen(true);
 
   QObject::connect(&_bulkTimer1, SIGNAL(timeout()), this, SLOT(showBulk()) );
   QObject::connect(&_bulkTimer2, SIGNAL(timeout()), this, SLOT(showBulk()) );

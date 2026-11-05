@@ -34,8 +34,6 @@ class CImePanel : public QWidget
 public:
 	explicit CImePanel(QWidget *parent = 0);
 
-	bool isOpen() const { return isVisible(); }
-
 	void setCjkFontFamily(const QString &family);
 
 	// buffer = what has been typed so far, candidates = the current page,
@@ -43,12 +41,13 @@ public:
 	void setState(const QString &buffer, const QStringList &candidates,
 	              int pageIndex, int pageCount);
 
-	void setBottomOffset(int px);
-
-	// Show / hide the strip.  Both are called by the terminal when a
-	// composition starts or ends.
-	void popup();
+	void popup();                  // bottom of the parent widget, full width
 	void dismiss();
+	bool isOpen() const { return isVisible(); }
+
+	// Pixels already taken at the very bottom (the custom key strip). The
+	// candidate strip sits on top of it instead of covering it.
+	void setBottomOffset(int px);
 
 	// Height the terminal has to keep free below its last row, so the strip
 	// sits *under* the text instead of on top of the cursor line.
@@ -79,9 +78,9 @@ private:
 
 	QString     _buffer;
 	QStringList _candidates;
-	int         _page;         // 0 based index of the page on screen
-	int         _pages;        // how many pages the engine has for this word
-	int         _highlight;    // candidate the frame is drawn around
+	int         _page;
+	int         _pages;
+	int         _highlight;   // index into the candidates of this page
 	int         _bottomOffset; // pixels taken below by the key strip
 	QTime       _lastStep;    // pacing for moveHighlight()
 

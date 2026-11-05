@@ -19,7 +19,6 @@ public:
 
     QToolButton *btnSettings;
     QToolButton *btnCmds;
-    QToolButton *btnQr;
     CMySettingsWindow *wdgSettingsWindow;
 
 protected:
@@ -29,7 +28,6 @@ protected:
 private slots:
 	void on_btnSettings_clicked();
 	void on_btnCmds_clicked();
-	void on_btnQr_clicked();
 };
 
 #endif

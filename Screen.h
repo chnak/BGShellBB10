@@ -232,8 +232,15 @@ public:
     /** Returns whether the specified screen @p mode is enabled or not .*/
     bool getMode     (int mode) const;
 
-    /** True while the program runs on the alternate screen buffer. */
-    bool isAlternateScreen() const;
+    /**
+     * Marks this screen as the alternate one (the buffer vi, less, top, mc,
+     * claude, pi ... draw into).  It never gets a history scroll, so the
+     * widget has nothing to scroll locally - see
+     * TerminalDisplay::scrollAlternateScreen().
+     */
+    void setAlternateScreen(bool on) { _alternateScreen = on; }
+    /** True for the alternate/application screen. */
+    bool isAlternateScreen() const { return _alternateScreen; }
    
     /** 
      * Saves the current position and appearence (text color and style) of the cursor. 
@@ -545,6 +552,9 @@ public:
 	static void fillWithDefaultChar(Character* dest, int count);
 
 private: 
+
+	// true only for the alternate/application screen (_screen[1])
+	bool _alternateScreen;
 
 	//copies a line of text from the screen or history into a stream using a 
 	//specified character decoder

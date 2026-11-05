@@ -570,21 +570,6 @@ switch( N )
     case TY_CSI_PS('m',  10) : /* IGNORED: mapping related          */ break; //LINUX
     case TY_CSI_PS('m',  11) : /* IGNORED: mapping related          */ break; //LINUX
     case TY_CSI_PS('m',  12) : /* IGNORED: mapping related          */ break; //LINUX
-
-    // Renditions this Character struct has no bit for.  They used to fall
-    // through to ReportErrorToken() and be printed as "undecodable token":
-    // claude emits SGR 3 (italic) in its normal output, so every markdown
-    // emphasis produced a spurious line on stdout.  Swallow them instead.
-    case TY_CSI_PS('m',   2) : /* IGNORED: faint                    */ break;
-    case TY_CSI_PS('m',   3) : /* IGNORED: italic                   */ break;
-    case TY_CSI_PS('m',   8) : /* IGNORED: conceal                  */ break;
-    case TY_CSI_PS('m',   9) : /* IGNORED: crossed out              */ break;
-    case TY_CSI_PS('m',  21) : /* IGNORED: doubly underlined        */ break;
-    case TY_CSI_PS('m',  23) : /* IGNORED: not italic               */ break;
-    case TY_CSI_PS('m',  28) : /* IGNORED: reveal                   */ break;
-    case TY_CSI_PS('m',  29) : /* IGNORED: not crossed out          */ break;
-    case TY_CSI_PS('m',  53) : /* IGNORED: overlined                */ break;
-    case TY_CSI_PS('m',  55) : /* IGNORED: not overlined            */ break;
     case TY_CSI_PS('m',  22) : _currentScreen->resetRendition     (RE_BOLD     ); break;
     case TY_CSI_PS('m',  24) : _currentScreen->resetRendition     (RE_UNDERLINE); break;
     case TY_CSI_PS('m',  25) : _currentScreen->resetRendition     (RE_BLINK    ); break;
@@ -783,22 +768,6 @@ switch( N )
     //       Here's a guess of what they could mean.
     case TY_CSI_PR('h', 1049) : saveCursor(); _screen[1]->clearEntireScreen(); setMode(MODE_AppScreen); break; //XTERM
     case TY_CSI_PR('l', 1049) : resetMode(MODE_AppScreen); restoreCursor(); break; //XTERM
-
-    //Modern full-screen TUIs (claude, pi, neovim, tmux) switch these on at
-    //startup and off at exit.  This emulator does not implement them, but
-    //silently accepting them is correct: they are all optional hints, and
-    //without a handler every one of them fell through to
-    //default: ReportErrorToken() and was printed as
-    //    undecodable token: \001b[?2026h
-    //on every redraw - thousands of lines during a long claude session.
-    case TY_CSI_PR('h', 1004) : /* IGNORED: focus in/out reporting    */ break;
-    case TY_CSI_PR('l', 1004) : /* IGNORED: focus in/out reporting    */ break;
-    case TY_CSI_PR('h', 2004) : /* IGNORED: bracketed paste mode      */ break;
-    case TY_CSI_PR('l', 2004) : /* IGNORED: bracketed paste mode      */ break;
-    case TY_CSI_PR('h', 2026) : /* IGNORED: synchronized output       */ break;
-    case TY_CSI_PR('l', 2026) : /* IGNORED: synchronized output       */ break;
-    case TY_CSI_PR('h', 2031) : /* IGNORED: light/dark theme report   */ break;
-    case TY_CSI_PR('l', 2031) : /* IGNORED: light/dark theme report   */ break;
 
     //FIXME: weird DEC reset sequence
     case TY_CSI_PE('p'      ) : /* IGNORED: reset         (        ) */ break;

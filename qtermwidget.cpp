@@ -21,11 +21,13 @@
 
 #include "qtermwidget.h"
 
+#include <QtCore/QTimer>
+
 #include "Session.h"
+#include "Pty.h"        // setWriteFd(): per-tab input routing
 #include "Emulation.h"
 #include "TerminalDisplay.h"
 #include "cshell.h"
-#include "cmdpanel.h"
 
 #include "mymainwindow.h"
 extern CMyMainWindow *mainWindow;
@@ -43,7 +45,6 @@ struct TermWidgetImpl
 
     TerminalDisplay *m_terminalDisplay;
     Session *m_session;
-    QPushButton *btnCtrlC;
     
     Session* createSession();
     TerminalDisplay* createTerminalDisplay(Session *session, QWidget* parent);
@@ -93,11 +94,16 @@ TerminalDisplay *TermWidgetImpl::createTerminalDisplay(Session *session, QWidget
 }
 
 QTermWidget::QTermWidget(int startnow, QWidget *parent)
-:QWidget(parent)
+:QWidget(parent), _shell(0)
 {
     m_impl = new TermWidgetImpl(this);
     
     init();
+
+    // A saved SSH host may carry a password: the display answers the prompt
+    // from the pty output, so it needs to see everything the shell prints.
+    connect(m_impl->m_session, SIGNAL(receivedData(QString)),
+            m_impl->m_terminalDisplay, SLOT(onSessionOutput(QString)));
 
     if (startnow && m_impl->m_session) {
     	m_impl->m_session->run();
@@ -132,12 +138,38 @@ void QTermWidget::init()
     m_impl->m_session->addView(m_impl->m_terminalDisplay);
     
     connect(m_impl->m_session, SIGNAL(finished()), this, SLOT(sessionFinished()));
+
+    // OSC 0 / OSC 2 title updates from the program running in this session.
+    connect(m_impl->m_session->emulation(), SIGNAL(titleChanged(int,QString)),
+            this, SLOT(onEmulationTitleChanged(int,QString)));
+
+    // rows/columns changed (widget resize, font change, IME strip, key bar):
+    // the pty has to be told, otherwise vim/tmux/claude draw for a grid that
+    // is not the one on screen - boxes break and the status line floats.
+    connect(m_impl->m_terminalDisplay, SIGNAL(changedContentSizeSignal(int,int)),
+            this, SLOT(onDisplayGridResized(int,int)));
 }
 
 
 QTermWidget::~QTermWidget()
 {
-    emit destroyed();
+    if (_shell) {
+        // Drop the pointers before the session goes away: the display and the
+        // send queue may outlive us by a few microseconds (child widgets are
+        // destroyed by ~QObject, after this body runs).
+        if (m_impl) {
+            if (m_impl->m_terminalDisplay)
+                m_impl->m_terminalDisplay->setInputSession(0);
+            if (m_impl->m_session && m_impl->m_session->shellProcess())
+                m_impl->m_session->shellProcess()->setWriteFd(-1);
+        }
+        _shell->hangup();
+        delete _shell;
+        _shell = 0;
+    }
+    // No emit destroyed() here: QObject emits its own destroyed(QObject*) from
+    // ~QObject, and an unqualified emit destroyed() only ever matched that
+    // signal - which made every close look like "the widget is already gone".
 }
 
 
@@ -181,6 +213,9 @@ void QTermWidget::setColorScheme(int scheme)
 	case COLOR_SCHEME_BLACK_ON_LIGHT_YELLOW:
 		m_impl->m_terminalDisplay->setColorTable(blackonlightyellow_color_table);
 		break;
+	case COLOR_SCHEME_BGSHELL:
+		m_impl->m_terminalDisplay->setColorTable(bgshell_color_table);
+		break;
 	default: //do nothing
 	    break;
     };
@@ -213,10 +248,124 @@ void QTermWidget::sendText(QString &text)
     m_impl->m_session->sendText(text); 
 }
 
+void QTermWidget::toggleCommandPanel()
+{
+    m_impl->m_terminalDisplay->toggleCommandPanel();
+}
+
+bool QTermWidget::imeTrackpadStep(int dx, int dy)
+{
+    if (!m_impl || !m_impl->m_terminalDisplay)
+        return false;
+    return m_impl->m_terminalDisplay->imeTrackpadStep(dx, dy);
+}
+
+bool QTermWidget::imeTrackpadClick()
+{
+    if (!m_impl || !m_impl->m_terminalDisplay)
+        return false;
+    return m_impl->m_terminalDisplay->imeTrackpadClick();
+}
+
 void QTermWidget::resizeEvent(QResizeEvent*)
 {
 //+++qDebug("global window resizing...with %d %d", this->size().width(), this->size().height());
 	m_impl->m_terminalDisplay->resize(this->size());
+	syncShellWindowSize();
+	// The display may finish its row/column arithmetic after the layout settles
+	// (child resize events are delivered bottom-up), so do one deferred pass
+	// too: a full-screen TUI that gets the old size repaints itself all over.
+	QTimer::singleShot(0, this, SLOT(syncShellWindowSize()));
+}
+
+// Any change of the character grid - resize, font change, IME strip, key bar -
+// ends in TerminalDisplay::updateImageSize() emitting this.  That is the only
+// place that knows the final rows/columns, and the pty must hear about it.
+void QTermWidget::onDisplayGridResized(int, int)
+{
+	syncShellWindowSize();
+}
+
+// Attach a real pty/shell.  Data flows straight into the emulation; keys and
+// pasted text leave through the shared active-fd hook in TerminalDisplay.
+void QTermWidget::attachShell(CShellSession *shell)
+{
+    if (!shell || !m_impl)
+        return;
+
+    _shell = shell;
+
+    // Input must leave through this tab's own pty, not through whichever tab
+    // happens to be in front when the write happens.  Both the Konsole side
+    // (Pty's send queue, fed by Emulation::sendData) and the direct writes in
+    // TerminalDisplay (pastes, IME, SYM panel, meta layer) are pointed here.
+    if (m_impl->m_session && m_impl->m_session->shellProcess())
+        m_impl->m_session->shellProcess()->setWriteFd(shell->fd());
+    if (m_impl->m_terminalDisplay)
+        m_impl->m_terminalDisplay->setInputSession(shell);
+
+    connect(shell, SIGNAL(dataReceived(QByteArray)),
+            this, SLOT(onShellData(QByteArray)));
+    connect(shell, SIGNAL(finished()), this, SLOT(sessionFinished()));
+
+    // Tell the shell how wide we are before the first prompt is drawn.
+    syncShellWindowSize();
+}
+
+void QTermWidget::onShellData(const QByteArray &data)
+{
+    if (!m_impl || data.isEmpty())
+        return;
+
+    if (m_impl->m_session && m_impl->m_session->emulation())
+        m_impl->m_session->emulation()->receiveData(data.constData(), data.size());
+
+    // The SSH password helper and the pinyin IME watch the raw stream.
+    if (m_impl->m_terminalDisplay)
+        m_impl->m_terminalDisplay->onSessionOutput(QString::fromLatin1(data));
+}
+
+void QTermWidget::syncShellWindowSize()
+{
+    if (!_shell || !m_impl || !m_impl->m_terminalDisplay)
+        return;
+    _shell->setWindowSize(m_impl->m_terminalDisplay->columns(),
+                          m_impl->m_terminalDisplay->lines());
+}
+
+// OSC 0 / OSC 2: the program says what this tab should be called.
+// vim sends the file name, ssh sends "user@host: ~", a configured bash
+// sends "$PWD".  Whatever arrives has to survive a 46 px high strip, so
+// control characters are dropped and the rest is collapsed and capped.
+static QString tabTitleFromOsc(const QString &raw)
+{
+    QString t;
+    t.reserve(raw.size());
+    for (int i = 0; i < raw.size(); ++i) {
+        const int u = raw.at(i).unicode();
+        if (u < 0x20 || u == 0x7f)
+            continue;
+        t.append(raw.at(i));
+    }
+    t = t.simplified();
+    if (t.size() > 72)
+        t = t.left(72);
+    return t;
+}
+
+void QTermWidget::onEmulationTitleChanged(int what, const QString &newTitle)
+{
+    // 0 = icon + title, 2 = title only, 1 = icon only -> not our business
+    if (what == 1)
+        return;
+
+    QString t = tabTitleFromOsc(newTitle);
+    if (t.isEmpty())
+        t = _defaultTitle;      // the program cleared it again
+    if (t.isEmpty())
+        return;
+
+    emit titleChanged(t);
 }
 
 void QTermWidget::sessionFinished()
@@ -238,161 +387,4 @@ bool QTermWidget::event( QEvent *e ){
 		return true;
 	}
 	return QWidget::event(e);
-}
-
-
-// ---------------------------------------------------------------------------
-// Multi-session + IME / command panel plumbing
-// ---------------------------------------------------------------------------
-
-// Hand this widget its own pty.  Without it the Konsole Session would ask the
-// patched kpty/k3process pair to fork a shell, and that pair can only ever
-// serve one session - which is why every tab used to share the first shell.
-void QTermWidget::attachShell(CShellSession *shell)
-{
-	if (_shell == shell)
-		return;
-	_shell = shell;
-	if (!_shell)
-		return;
-
-	connect(_shell, SIGNAL(dataReceived(QByteArray)),
-	        this, SLOT(onShellData(QByteArray)));
-	connect(_shell, SIGNAL(finished()),
-	        this, SLOT(sessionFinished()));
-
-	// The emulation tells us the grid size; the pty has to follow.
-	if (m_impl && m_impl->m_terminalDisplay) {
-		connect(m_impl->m_terminalDisplay,
-		        SIGNAL(changedContentSizeSignal(int,int)),
-		        this, SLOT(onDisplayGridResized(int,int)),
-		        Qt::DirectConnection);
-	}
-
-	// OSC 0 / OSC 2 rename the tab.
-	Emulation *emulation = (m_impl && m_impl->m_session)
-	                     ? m_impl->m_session->emulation() : 0;
-	if (emulation) {
-		connect(emulation, SIGNAL(titleChanged(int,QString)),
-		        this, SLOT(onEmulationTitleChanged(int,QString)),
-		        Qt::DirectConnection);
-	}
-
-	syncShellWindowSize();
-}
-
-// Bytes from the pty go into the emulation, which updates the screen and the
-// character grid behind it.
-void QTermWidget::onShellData(const QByteArray &data)
-{
-	if (!m_impl || !m_impl->m_session || data.isEmpty())
-		return;
-	Emulation *emulation = m_impl->m_session->emulation();
-	if (!emulation)
-		return;
-	emulation->receiveData(data.constData(), data.size());
-}
-
-// The character grid changed size (widget, font or bottom reserve).  Konsole's
-// own plumbing cannot push this to the pty: the Pty object it keeps is never
-// started, so its setWindowSize() is a no-op.
-void QTermWidget::onDisplayGridResized(int height, int width)
-{
-	Q_UNUSED(height);
-	Q_UNUSED(width);
-	syncShellWindowSize();
-}
-
-// Push the current grid size to the shell (TIOCSWINSZ), so a program that asks
-// getsize sees the truth instead of the 100x30 the pty was created with.
-void QTermWidget::syncShellWindowSize()
-{
-	if (!_shell || !_shell->isRunning() || !m_impl || !m_impl->m_terminalDisplay)
-		return;
-
-	const int cols = m_impl->m_terminalDisplay->columns();
-	const int rows = m_impl->m_terminalDisplay->lines();
-	if (cols > 1 && rows > 1)
-		_shell->setWindowSize(cols, rows);
-}
-
-void QTermWidget::onEmulationTitleChanged(int what, const QString &newTitle)
-{
-	Q_UNUSED(what);
-	const QString title = newTitle.trimmed().isEmpty() ? _defaultTitle
-	                                                   : newTitle.trimmed();
-	emit titleChanged(title);
-}
-
-// Trackpad driving of the IME candidate strip (see main.cpp).  True means the
-// strip consumed the movement, so it does not also become an arrow key for the
-// shell.
-bool QTermWidget::imeTrackpadStep(int dx, int dy)
-{
-	if (!m_impl || !m_impl->m_terminalDisplay)
-		return false;
-	return m_impl->m_terminalDisplay->imeTrackpadStep(dx, dy);
-}
-
-bool QTermWidget::imeTrackpadClick()
-{
-	if (!m_impl || !m_impl->m_terminalDisplay)
-		return false;
-	return m_impl->m_terminalDisplay->imeTrackpadClick();
-}
-
-// Quick commands / saved SSH hosts overlay.
-void QTermWidget::toggleCommandPanel()
-{
-	if (!_panel) {
-		_panel = new CCommandPanel(this);
-		connect(_panel, SIGNAL(commandChosen(QString,bool)),
-		        this, SLOT(onCommandChosen(QString,bool)));
-		connect(_panel, SIGNAL(sshChosen(QString,QString,int,QString,QString)),
-		        this, SLOT(onSshChosen(QString,QString,int,QString,QString)));
-	}
-
-	if (_panel->isOpen())
-		_panel->dismiss();
-	else
-		_panel->popup();
-}
-
-// "Insert" puts the line on the command line so it can still be edited;
-// "Run" adds the Enter.
-void QTermWidget::onCommandChosen(const QString &command, bool run)
-{
-	if (_panel)
-		_panel->dismiss();
-
-	QString text = command;
-	if (run)
-		text += QLatin1Char('\r');
-	sendText(text);
-	setFocus();
-}
-
-// Build the ssh command line and type it.  A saved key is passed through -i;
-// a saved password is left to the interactive prompt, because typing it into
-// the pty ourselves would put it on the screen and into the scrollback.
-void QTermWidget::onSshChosen(const QString &user, const QString &host, int port,
-                              const QString &identity, const QString &password)
-{
-	Q_UNUSED(password);
-
-	if (_panel)
-		_panel->dismiss();
-
-	QString cmd = QString("ssh");
-	if (port > 0 && port != 22)
-		cmd += QString(" -p %1").arg(port);
-	if (!identity.trimmed().isEmpty())
-		cmd += QString(" -i %1").arg(identity.trimmed());
-	if (!user.trimmed().isEmpty())
-		cmd += QLatin1Char(' ') + user.trimmed() + QLatin1Char('@');
-	cmd += host.trimmed();
-	cmd += QLatin1Char('\r');
-
-	sendText(cmd);
-	setFocus();
 }

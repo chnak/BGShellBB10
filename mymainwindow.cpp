@@ -19,7 +19,6 @@
 #include "mysystemmenu.h"
 #include "mysettingswindow.h"
 #include "qtermwidget.h"
-#include "qrscanner.h"
 #include "csessiontabs.h"
 #include "cshell.h"
 
@@ -42,8 +41,7 @@ CMyMainWindow::CMyMainWindow() :
 	QMainWindow(),
 	_menuDownY(0),
 	_menuTracking(false),
-	_menuSwallow(false),
-	_qrScanner(0)
+	_menuSwallow(false)
 {
 	// Behind the terminal (e.g. while the keyboard resizes it) never show
 	// the default grey: paint the same backdrop the terminal uses.
@@ -406,46 +404,6 @@ void CMyMainWindow::sessionMenu()
         SystemMenu->raise();     // the tab strip is its sibling: stay on top
         SystemMenu->show();
     }
-}
-
-// The QR scanner.  The overlay covers the terminal and the tab strip, so it
-// is raised above both; the camera is opened when the overlay appears and
-// released when it goes away, because it is a shared resource.
-void CMyMainWindow::sessionQrScan()
-{
-    if (!_qrScanner) {
-        _qrScanner = new CMyQrScanner(this);
-        connect(_qrScanner, SIGNAL(scanned(QString)),
-                this, SLOT(qrScanned(QString)));
-        connect(_qrScanner, SIGNAL(insertRequested(QString)),
-                this, SLOT(qrInsert(QString)));
-    }
-
-    if (_qrScanner->isOpen()) {
-        _qrScanner->dismiss();
-        return;
-    }
-
-    _qrScanner->popup();
-    _qrScanner->raise();
-}
-
-// The code is already on the clipboard (the scanner copies it there), so all
-// that is left is to say so - the overlay shows the text itself.
-void CMyMainWindow::qrScanned(const QString &text)
-{
-    qDebug("qr: scanned %d chars", text.length());
-}
-
-// Put the scanned text on the command line of the active tab.  It is typed
-// in, not executed: the user still decides whether to press Enter.
-void CMyMainWindow::qrInsert(const QString &text)
-{
-    if (text.isEmpty() || !console)
-        return;
-    QString t = text;
-    console->sendText(t);
-    console->setFocus();
 }
 
 void CMyMainWindow::sessionTitleChanged(const QString &title)

@@ -26,7 +26,6 @@
 
 struct TermWidgetImpl;
 class CShellSession;
-class CCommandPanel;
 
 enum COLOR_SCHEME {     COLOR_SCHEME_WHITE_ON_BLACK	= 1,
 		        COLOR_SCHEME_GREEN_ON_BLACK,
@@ -101,6 +100,9 @@ public:
     void attachShell(CShellSession *shell);
     CShellSession *shell() const { return _shell; }
 
+    // Push the current character grid to the pty (TIOCSWINSZ).
+    void syncShellWindowSize();
+
     // Tab title.  Programs announce it with OSC 0 / OSC 2
     // ("\033]0;user@host: ~/src\007"); vim, tmux, ssh and bash all do.
     // The default is used when the program clears the title again.
@@ -114,15 +116,6 @@ protected:
     virtual void resizeEvent(QResizeEvent *);
     virtual bool event( QEvent * ); //+++
     
-public slots:
-    // Push the current character grid to the pty (TIOCSWINSZ).  This must be a
-    // slot: qtermwidget.cpp queues it with QTimer::singleShot(...,
-    // SLOT(syncShellWindowSize())), and Qt resolves that string at runtime.
-    // When it was a plain public method every resize logged
-    //   QMetaObject::invokeMethod: No such method QTermWidget::syncShellWindowSize()
-    // and the deferred resize was silently dropped.
-    void syncShellWindowSize();
-
 protected slots:
     void sessionFinished();
     void onShellData(const QByteArray &data);
@@ -132,17 +125,12 @@ protected slots:
     // started, so its setWindowSize() is a no-op.
     void onDisplayGridResized(int height, int width);
     void onEmulationTitleChanged(int what, const QString &newTitle);
-    // The command panel handed us a line to type (run=false) or to run.
-    void onCommandChosen(const QString &command, bool run);
-    void onSshChosen(const QString &user, const QString &host, int port,
-                     const QString &identity, const QString &password);
-
+    
 private:
-    void init();
+    void init();    
     TermWidgetImpl *m_impl;
     CShellSession   *_shell;
     QString          _defaultTitle;
-    CCommandPanel   *_panel;   // created on first use
 };
 
 
