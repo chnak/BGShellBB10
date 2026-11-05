@@ -395,6 +395,123 @@ void bgshellApplyFont()
     }
 }
 
+// Qt 4 has no QDir::removeRecursively(), so this does it by hand.
+static void bgshellRemoveTree(const QString &path)
+{
+    QDir dir(path);
+    if (!dir.exists())
+        return;
+    const QFileInfoList entries =
+        dir.entryInfoList(QDir::Files | QDir::Dirs | QDir::Hidden | QDir::NoDotAndDotDot);
+    for (int i = 0; i < entries.size(); ++i) {
+        const QFileInfo &e = entries.at(i);
+        if (e.isDir())
+            bgshellRemoveTree(e.absoluteFilePath());
+        else
+            QFile::remove(e.absoluteFilePath());
+    }
+    QDir().rmdir(path);
+}
+
+// Copy a directory tree, skipping anything that already exists at the
+// destination - this only ever fills in what is missing.
+static void bgshellCopyTree(const QString &from, const QString &to)
+{
+    QDir src(from);
+    if (!src.exists())
+        return;
+    QDir().mkpath(to);
+
+    const QFileInfoList entries =
+        src.entryInfoList(QDir::Files | QDir::Dirs | QDir::Hidden | QDir::NoDotAndDotDot);
+    for (int i = 0; i < entries.size(); ++i) {
+        const QFileInfo &e = entries.at(i);
+        const QString dst = to + "/" + e.fileName();
+        if (e.isDir())
+            bgshellCopyTree(e.absoluteFilePath(), dst);
+        else if (!QFile(dst).exists())
+            QFile::copy(e.absoluteFilePath(), dst);
+    }
+}
+
+// Persistent data lives in the shared folder, not in the app sandbox.
+//
+// Everything the app remembers - settings, saved SSH hosts, keys, known_hosts,
+// the hex logs - is written under "data/" relative to the working directory,
+// which is appdata/<app id>/data.  That directory is deleted when the bar is
+// reinstalled, so every update used to wipe the user's setup.
+//
+// Here "data" is turned into a symlink to /accounts/1000/shared/bgshell, which
+// survives a reinstall.  Anything already in the sandbox is copied over first,
+// and if the shared folder cannot be written (no access_shared permission) the
+// app simply keeps using the sandbox - it never fails to start.
+// Pick the first place outside the sandbox that this app can actually write.
+// /accounts/1000/shared itself is group writable but refuses mkdir even for
+// the shared group, so the writable spots are its "misc" subfolder and the
+// SD card.  The sandbox is the last resort - it works, it just does not
+// survive a reinstall.
+static QString bgshellPickDataRoot()
+{
+    static const char *candidates[] = {
+        "/accounts/1000/removable/sdcard/bgshell",   // SD card: best, if present
+        "/accounts/1000/shared/bgshell",
+        "/accounts/1000/shared/misc/bgshell",
+        0
+    };
+
+    for (int i = 0; candidates[i]; ++i) {
+        const QString dir = QString::fromLatin1(candidates[i]);
+        if (!QDir().mkpath(dir))
+            continue;
+        QFile probe(dir + "/.write-test");
+        if (!probe.open(QIODevice::WriteOnly))
+            continue;
+        probe.close();
+        probe.remove();
+        return dir;
+    }
+    return QString();
+}
+
+static void bgshellSetupDataDir(const QString &cwd)
+{
+    const QString dataLink = cwd + "/data";
+
+    const QFileInfo linkInfo(dataLink);
+    if (linkInfo.isSymLink()) {
+        // Already pointed at a persistent directory from an earlier run.
+        return;
+    }
+
+    const QString sharedRoot = bgshellPickDataRoot();
+    if (sharedRoot.isEmpty()) {
+        qWarning() << "bgshell: no writable shared folder, keeping data in the sandbox";
+        return;
+    }
+
+    // Move what is already there so nothing is lost on the first update.
+    if (linkInfo.exists())
+        bgshellCopyTree(dataLink, sharedRoot);
+
+    if (linkInfo.isDir())
+        bgshellRemoveTree(dataLink);
+    QFile::remove(dataLink);
+    if (!QFile::link(sharedRoot, dataLink)) {
+        qWarning() << "bgshell: cannot link" << dataLink << "to" << sharedRoot;
+        QDir().mkpath(dataLink);   // keep the app usable
+        return;
+    }
+    qDebug() << "bgshell: persistent data in" << sharedRoot;
+}
+
+// Point QSettings at the same persistent directory, so the saved values
+// outlive an update too.  Default constructed QSettings objects pick this up.
+static void bgshellSetupSettings(const QString &dir)
+{
+    QSettings::setPath(QSettings::IniFormat,    QSettings::UserScope, dir);
+    QSettings::setPath(QSettings::NativeFormat, QSettings::UserScope, dir);
+}
+
 int main(int argc, char *argv[])
 {
     // Let's search for programs first in our own 'app' folder
@@ -404,6 +521,16 @@ int main(int argc, char *argv[])
     if (getcwd(cwd, sizeof(cwd)) == NULL){
         fprintf(stderr, "Can't determine my current folder, terminating");
         exit(-1);
+    }
+
+    // Must happen before anything reads data/ - settings, ssh keys and the
+    // saved hosts all live there.
+    bgshellSetupDataDir(QString(cwd));
+    {
+        const QFileInfo dl(QString(cwd) + "/data");
+        const QString persistent = dl.isSymLink() ? dl.symLinkTarget()
+                                                  : QString(cwd) + "/data";
+        bgshellSetupSettings(persistent);
     }
     // ---- which ssh? -----------------------------------------------------
     // BB10 already ships OpenSSH in its read-only system partition; the app

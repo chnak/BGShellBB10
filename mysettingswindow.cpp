@@ -45,11 +45,21 @@ QWidget *settingsRow(QWidget *parent, const QString &title,
 	QLabel *t = new QLabel(title, w);
 	t->setStyleSheet(QString("QLabel { color: %1; font-size: 25px; }")
 	                     .arg(UiTheme::hex(UiTheme::Text)));
+	// A label that cannot wrap reports the width of its whole text as its
+	// minimum, and a combo box reports the width of its longest item.  Either
+	// one alone can make the row wider than the card, and the text then runs
+	// out past the rounded border.  Wrapping the text and capping the control
+	// keeps every row inside the card.
+	t->setWordWrap(true);
+	t->setMinimumWidth(0);
+	t->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
 	text->addWidget(t);
 
 	if (!hint.isEmpty()) {
 		QLabel *d = new QLabel(hint, w);
 		d->setWordWrap(true);
+		d->setMinimumWidth(0);
+		d->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
 		d->setStyleSheet(UiTheme::subtitleStyle());
 		text->addWidget(d);
 	}
@@ -57,6 +67,9 @@ QWidget *settingsRow(QWidget *parent, const QString &title,
 	h->addLayout(text, 1);
 	if (control) {
 		control->setParent(w);
+		const int cap = qMax(160, QApplication::desktop()->screenGeometry(0).width() * 2 / 5);
+		if (control->maximumWidth() > cap)
+			control->setMaximumWidth(cap);
 		h->addWidget(control, 0, Qt::AlignVCenter);
 	}
 	return w;
