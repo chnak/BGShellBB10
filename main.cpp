@@ -396,6 +396,24 @@ void bgshellApplyFont()
     }
 }
 
+// Qt 4 has no QDir::removeRecursively(), so this does it by hand.
+static void bgshellRemoveTree(const QString &path)
+{
+    QDir dir(path);
+    if (!dir.exists())
+        return;
+    const QFileInfoList entries =
+        dir.entryInfoList(QDir::Files | QDir::Dirs | QDir::Hidden | QDir::NoDotAndDotDot);
+    for (int i = 0; i < entries.size(); ++i) {
+        const QFileInfo &e = entries.at(i);
+        if (e.isDir())
+            bgshellRemoveTree(e.absoluteFilePath());
+        else
+            QFile::remove(e.absoluteFilePath());
+    }
+    QDir().rmdir(path);
+}
+
 // Copy a directory tree, skipping anything that already exists at the
 // destination - this only ever fills in what is missing.
 static void bgshellCopyTree(const QString &from, const QString &to)
@@ -444,6 +462,30 @@ static QString bgshellPickDataRoot()
     return QString();
 }
 
+// Point the sandbox's .claude directory at the persistent one, so the
+// skills and CLAUDE.md survive a reinstall.  The sandbox directory can be
+// linked to (the app owns data/), unlike data/ itself.
+static void bgshellLinkClaudeDir(const QString &cwd, const QString &sharedRoot)
+{
+    const QString persistent = sharedRoot + "/.claude";
+    if (!QFileInfo(persistent).exists())
+        return;                       // nothing to point at yet
+
+    const QString link = cwd + "/data/.claude";
+    const QFileInfo info(link);
+    if (info.isSymLink() && info.symLinkTarget() == persistent)
+        return;
+    if (info.exists() && !info.isSymLink()) {
+        // A real directory: keep what is in it, then replace it with a link.
+        bgshellCopyTree(link, persistent);
+        bgshellRemoveTree(link);
+    }
+    if (!QFile::link(persistent, link))
+        qWarning() << "bgshell: cannot link" << link << "to" << persistent;
+    else
+        qDebug() << "bgshell: .claude ->" << persistent;
+}
+
 // Persistent data lives in the shared folder, not in the app sandbox.
 //
 // Everything the app remembers - settings, saved SSH hosts, keys, known_hosts,
@@ -467,6 +509,12 @@ static void bgshellSetupDataDir(const QString &cwd)
     // subdirectories the app expects exist.
     bgshellCopyTree(cwd + "/data", sharedRoot);
     QDir().mkpath(sharedRoot + "/.ssh");
+
+    // The Claude Code configuration that lives in the shell app's sandbox
+    // (data/.claude) holds the skills and the answer book.  That directory is
+    // wiped by a reinstall, so point it at the persistent one whenever the
+    // persistent copy has something in it.
+    bgshellLinkClaudeDir(cwd, sharedRoot);
 
     bgshellSetDataRoot(sharedRoot);
     qDebug() << "bgshell: persistent data in" << sharedRoot;
