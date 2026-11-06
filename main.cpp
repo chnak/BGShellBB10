@@ -286,7 +286,10 @@ QTermWidget *bgshellCreateSession()
     term->attachShell(sh);
     term->setTerminalFont(font);
     term->setColorScheme(COLOR_SCHEME_BGSHELL);
-    term->setScrollBarPosition(QTermWidget::ScrollBarRight);
+    // No scroll bar: on a touch screen it takes a strip of the width away
+    // from the character grid, and the scrollback is reachable by dragging
+    // the text up (or with the wheel) anyway.
+    term->setScrollBarPosition(QTermWidget::NoScrollBar);
 
     QSettings settings;
     const int nHistory = settings.value("HistorySize", 2000).toInt();
@@ -462,16 +465,35 @@ static QString bgshellPickDataRoot()
     return QString();
 }
 
-// Point the sandbox's .claude directory at the persistent one, so the
-// skills and CLAUDE.md survive a reinstall.  The sandbox directory can be
-// linked to (the app owns data/), unlike data/ itself.
-static void bgshellLinkClaudeDir(const QString &cwd, const QString &sharedRoot)
+// The files setup-bb10-claude.sh puts into every HOME.  They carry the PATH
+// hook for BerryCore's node/npm/claude, the API key and the Claude Code
+// settings, so losing them means the tools cannot be found any more.
+static const char *kHomeFiles[] = {
+    ".profile", ".bashrc", ".ai_cli.sh", ".claude-bb10.env",
+    "claude.key", ".claude.json", 0
+};
+
+// Put back what the sandbox is missing from the persistent directory, and
+// point .claude at the persistent one so the skills and the answer book
+// survive a reinstall as well.
+static void bgshellRestoreHome(const QString &cwd, const QString &sharedRoot)
 {
+    const QString sandbox = cwd + "/data";
+    QDir().mkpath(sandbox);
+
+    for (int i = 0; kHomeFiles[i]; ++i) {
+        const QString name = QString::fromLatin1(kHomeFiles[i]);
+        const QString from = sharedRoot + "/" + name;
+        const QString to   = sandbox + "/" + name;
+        if (QFileInfo(from).exists() && !QFileInfo(to).exists())
+            QFile::copy(from, to);
+    }
+
     const QString persistent = sharedRoot + "/.claude";
     if (!QFileInfo(persistent).exists())
-        return;                       // nothing to point at yet
+        return;
 
-    const QString link = cwd + "/data/.claude";
+    const QString link = sandbox + "/.claude";
     const QFileInfo info(link);
     if (info.isSymLink() && info.symLinkTarget() == persistent)
         return;
@@ -510,11 +532,14 @@ static void bgshellSetupDataDir(const QString &cwd)
     bgshellCopyTree(cwd + "/data", sharedRoot);
     QDir().mkpath(sharedRoot + "/.ssh");
 
-    // The Claude Code configuration that lives in the shell app's sandbox
-    // (data/.claude) holds the skills and the answer book.  That directory is
-    // wiped by a reinstall, so point it at the persistent one whenever the
-    // persistent copy has something in it.
-    bgshellLinkClaudeDir(cwd, sharedRoot);
+    // The shell app's sandbox (data/) is the HOME of the shell that runs
+    // inside it.  setup-bb10-claude.sh writes the PATH hook, the API key and
+    // the Claude Code configuration into that HOME - and a reinstall wipes
+    // it, which is why node, npm and claude stop being found afterwards.
+    //
+    // So the persistent copy is the master: everything the sandbox is
+    // missing is put back, and .claude is linked rather than copied.
+    bgshellRestoreHome(cwd, sharedRoot);
 
     bgshellSetDataRoot(sharedRoot);
     qDebug() << "bgshell: persistent data in" << sharedRoot;
