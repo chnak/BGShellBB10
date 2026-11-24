@@ -541,7 +541,13 @@ switch( N )
     case TY_ESC_DE('8'      ) : _currentScreen->helpAlign            (          ); break;
 
 // resize = \e[8;<row>;<col>t
-    case TY_CSI_PS('t',   8) : setImageSize( q /* colums */, p /* lines */ );    break;
+// The parameters are height first, width second (xterm ctlseqs: "CSI P s ; P s ;
+// P s t - resize the text area to the given height and width"), and
+// setImageSize() takes (lines, columns).  They used to be handed over the
+// other way round, which turned a request for 24 rows x 80 columns into a
+// screen of 80 rows x 24 columns - the grid then no longer matched the one
+// the widget paints, and the pty was told about the wrong size.
+    case TY_CSI_PS('t',   8) : setImageSize( p /* rows */, q /* columns */ );    break;
 
 // change tab text color : \e[28;<color>t  color: 0-16,777,215
     case TY_CSI_PS('t',   28) : emit changeTabTextColorRequest      ( p        );          break;

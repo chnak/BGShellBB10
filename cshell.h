@@ -62,6 +62,7 @@ private:
 	int               _pid;
 	QSocketNotifier  *_notifier;
 	bool              _dead;
+	bool              _closing;   // we killed it ourselves (tab closed)
 };
 
 #endif // CSHELL_H

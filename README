@@ -135,6 +135,24 @@ Release notes:
     -- scrollback depth is a setting now (500 / 1000 / 2000 / 5000 / 10000);
        applied at startup and to the running session
 
+- 0.0.3.10
+    -- the candidate strip can be picked with the keyboard again: the digits
+       of the BB10 Alt layer (Alt+W = 1, Alt+E = 2, ...) choose a candidate
+       while the strip is open - before, the Alt key reached the shell as
+       plain text and the candidate was lost;
+    -- fixed the xterm resize sequence (CSI 8 ; rows ; cols t): height and
+       width were handed over swapped, so a request for 24 rows x 80 columns
+       turned into 80 rows x 24 columns and the grid no longer matched the
+       window (and the pty was told the wrong size);
+    -- a program that asks for a screen of zero rows can no longer take the
+       app down: the cursor ended up at -1 and the next character was written
+       outside the screen buffer - a wild write that kills the whole app;
+    -- new: crashes and resizes leave a trace in bgshell-diag.log inside the
+       persistent directory.  The log is written outside the sandbox, so it
+       survives the death of the app: it names the signal, the memory the
+       app was using, how fast the program talked to the terminal and how
+       the shell died.
+
 - 0.0.3.9
     -- fixed the stray spaces / line break that followed "pick a word with
        Space": committing empties the composition at once, but the echo of
@@ -442,6 +460,16 @@ drive), so the IME runs inside the widget, exactly like Term50's:
   they are plain punctuation: the letters typed so far go out first and the
   shell then gets the `,` itself, so `hello, world` keeps its comma.
   **Esc** drops the composition without sending anything.
+* the **1-8** of the strip are the **Alt layer** of these keyboards: **Alt+W**
+  is 1, **Alt+E** is 2, **Alt+R** is 3, ... **Alt+C** is 9. A Q30 has no
+  number row of its own, so **Alt+W** takes candidate 1, **Alt+E** candidate 2
+  and so on - while a composition runs, the IME hands those digits to the
+  candidate strip instead of letting them fall through to the shell.
+  These keyboards **latch** Alt: tapping Alt on its own sends a key event of
+  its own (no character, no modifier set), and the key pressed after it
+  carries the Alt. Such an event carries nothing for the engine to do, so it
+  no longer ends the composition - pressing Alt while the strip is up leaves
+  the candidates alone, and the **Alt+W** that follows picks one of them.
 * **Enter** does not take a candidate: while composing it commits the
   letters you typed as plain English (`Hello` -> `Hello`), so typing an
   English word never needs a 中/EN toggle. Nothing is appended - no space
@@ -512,6 +540,13 @@ from the right one) and `tests/run-ime-page-check.sh` (when `,` `.` `-` `[` `]`
 `=` page the candidates and when they stay plain punctuation). Both compile code
 lifted verbatim out of `TerminalDisplay.cpp`, so they cannot drift away from
 what ships.
+
+Two more do the same for the digits of the Alt layer:
+`tests/run-alt-layer-check.sh` (Alt+W is 1, Alt+E is 2, ... Alt+C is 9) and
+`tests/run-ime-alt-digit-check.sh` (while a composition runs those chords pick
+a candidate instead of falling through to the shell as a stray digit). The
+second one links the lifted key handling against the real engine
+(`cjk_ime.c`), so it replays what the phone actually sends.
 
 Other chords: **Alt+Enter = 中文/EN**, **Ctrl+Space = the same**,
 **Alt+Space = Tab**, **Shift+Alt+key = Ctrl+key**, and double-tapping the

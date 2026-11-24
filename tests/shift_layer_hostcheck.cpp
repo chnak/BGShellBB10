@@ -62,7 +62,9 @@ public:
             event->key() == Qt::Key_K || event->key() == Qt::Key_L ? "ARROW" : "ACTION");
     }
 
-    void td_send_ctrl_key(QKeyEvent *event)
+    // The name of the shipped member (TerminalDisplay::sendCtrlKey), which
+    // the lifted block calls by name.
+    void sendCtrlKey(QKeyEvent *event)
     {
         ctrlByte = (char)(event->key() & 0x1f);
         ++ctrlBytes;
@@ -134,12 +136,16 @@ int main()
     feed(t2, T0 + 150, Qt::Key_Shift, KEYCODE_LEFT_SHIFT);
     check("double-tap LEFT shift -> no layer", t2, false, "");
 
-    // 3. double-tapping the RIGHT shift arms it
+    // 3. double-tapping the RIGHT shift does NOT arm a layer any more
+    // The sticky CTRL layer was removed on purpose: "a latched layer that
+    // hijacked e (Esc), v (paste) and i/o (font size) was far too easy to trip
+    // by accident on a phone keypad" (TerminalDisplay.cpp).  The right Shift
+    // is hold-only Ctrl now - press, hit a key, release.
     TerminalDisplay t3;
     feed(t3, T0,       Qt::Key_Shift, KEYCODE_RIGHT_SHIFT);
     feed(t3, T0 + 150, Qt::Key_Shift, KEYCODE_RIGHT_SHIFT);
     feed(t3, T0 + 300, Qt::Key_K,     KEYCODE_RIGHT_SHIFT);
-    check("double-tap RIGHT shift -> layer armed", t3, true, "ARROW");
+    check("double-tap RIGHT shift -> no layer", t3, false, "^K", 1);
 
     // 4. holding the right shift is Ctrl, and it is released with the key
     TerminalDisplay t4;
@@ -156,11 +162,11 @@ int main()
     if (!ok4)
         ++failures;
 
-    // 5. no keycode reported at all: double tap of either shift still works
+    // 5. no keycode reported at all: a double tap still does nothing
     TerminalDisplay t5;
     feed(t5, T0,       Qt::Key_Shift, 0);
     feed(t5, T0 + 150, Qt::Key_Shift, 0);
-    check("no keycode: double-tap shift -> layer", t5, true, "");
+    check("no keycode: double-tap shift -> no layer", t5, false, "");
 
     // 6. ... but a letter in between still cancels it
     TerminalDisplay t6;
@@ -183,10 +189,11 @@ int main()
     feed(t8, T0 + 200, Qt::Key_Right, 0x0100);
     check("right arrow, letter between -> no layer", t8, false, "H");
 
+    // 9. the right arrow has no double-tap entry point any more either
     TerminalDisplay t9;
     feed(t9, T0,       Qt::Key_Right, 0x0100);
     feed(t9, T0 + 120, Qt::Key_Right, 0x0100);
-    check("double-tap RIGHT arrow -> layer", t9, true, "");
+    check("double-tap RIGHT arrow -> no layer", t9, false, "");
 
     std::printf("\n%s (%d failure%s)\n",
                 failures ? "BUILD/RUN FAILED" : "ALL HOST CHECKS PASSED",

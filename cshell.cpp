@@ -1,4 +1,5 @@
 #include "cshell.h"
+#include "diag.h"
 
 #include <QtCore>
 
@@ -16,7 +17,8 @@
 #include <termios.h>
 
 CShellSession::CShellSession(QObject *parent)
-	: QObject(parent), _fd(-1), _pid(-1), _notifier(0), _dead(false)
+	: QObject(parent), _fd(-1), _pid(-1), _notifier(0), _dead(false),
+	  _closing(false)
 {
 }
 
@@ -161,6 +163,8 @@ bool CShellSession::start(int cols, int rows, const QString &program, const QStr
 	fcntl(_fd, F_SETFL, fcntl(_fd, F_GETFL) | O_NONBLOCK);
 	_dead = false;
 
+	bgshellDiag("shell start pid=%d cols=%d rows=%d", (int)_pid, cols, rows);
+
 	_notifier = new QSocketNotifier(_fd, QSocketNotifier::Read, this);
 	connect(_notifier, SIGNAL(activated(int)), this, SLOT(onReadable()));
 
@@ -261,6 +265,8 @@ void CShellSession::setWindowSize(int cols, int rows)
 
 void CShellSession::hangup()
 {
+	// We are killing it on purpose - do not report that as a crash.
+	_closing = true;
 	if (_pid > 0) {
 		kill(_pid, SIGHUP);
 		kill(_pid, SIGTERM);
@@ -289,5 +295,22 @@ void CShellSession::reap()
 	int status = 0;
 	const pid_t r = ::waitpid(_pid, &status, WNOHANG);
 	if (r == _pid || (r < 0 && errno == ECHILD))
+	{
+		// Say how the shell died.  A program inside it (node, claude) that
+		// crashes leaves a signal behind, and this line is the only trace
+		// of it - the app itself may be gone before anybody looks.
+		if (r == _pid && !_closing)
+		{
+			if (WIFSIGNALED(status))
+				bgshellDiag("shell pid=%d killed by signal %d",
+				            (int)_pid, WTERMSIG(status));
+			else if (WIFEXITED(status))
+				bgshellDiag("shell pid=%d exited with code %d",
+				            (int)_pid, WEXITSTATUS(status));
+			else
+				bgshellDiag("shell pid=%d gone (status 0x%x)",
+				            (int)_pid, (unsigned)status);
+		}
 		_pid = -1;
+	}
 }

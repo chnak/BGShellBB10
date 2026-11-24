@@ -46,6 +46,7 @@ int gSshMinor = 0;
 #include "cshell.h"
 #include "csessiontabs.h"
 #include "bgshelldirs.h"
+#include "diag.h"
 
 // Headers for trackpad event handling
 #include <screen/screen.h>
@@ -568,6 +569,9 @@ int main(int argc, char *argv[])
     // saved hosts all live there.
     bgshellSetupDataDir(QString(cwd));
     bgshellSetupSettings(bgshellDataRoot());
+    // From here on every crash and every resize leaves a trace in the
+    // persistent data directory - see diag.h.
+    bgshellDiagInit();
     // ---- which ssh? -----------------------------------------------------
     // BB10 already ships OpenSSH in its read-only system partition; the app
     // also carries a bundle (ssh/scp/sftp/ssh-keygen + libcrypto/libz) under
@@ -646,6 +650,7 @@ int main(int argc, char *argv[])
     //QCoreApplication::addLibraryPath("app/native/lib"); // blackberry plugin does not load without this line
 
     QApplication app(argc, argv);
+    bgshellDiagHeartbeat();
 
     gTerminalFontFamily = installBundledFont();
 

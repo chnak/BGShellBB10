@@ -27,6 +27,7 @@
 
 // Own
 #include "Emulation.h"
+#include "diag.h"
 
 // System
 #include <assert.h>
@@ -432,8 +433,23 @@ char Emulation::getErase() const
 void Emulation::setImageSize(int lines, int columns)
 {
   //kDebug() << "Resizing image to: " << lines << "by" << columns << QTime::currentTime().msec();
+
+  // A program can ask for a size of its own: xterm's "CSI 8 ; rows ; cols t"
+  // and DECCOLM (80/132 columns) both end up here.  A size of zero would
+  // leave the screen without a single row: the cursor then moves to -1 and
+  // the next character is written to screenLines[-1] - a wild write that
+  // takes the whole app down with it.  A huge size would allocate the whole
+  // grid (and get the app killed for it).  Clamp both ends.
+  if (lines < 1)     lines = 1;
+  if (columns < 1)   columns = 1;
+  if (lines > 1000)   lines = 1000;
+  if (columns > 1000) columns = 1000;
+
   Q_ASSERT( lines > 0 );
   Q_ASSERT( columns > 0 );
+
+  if (lines != _screen[0]->getLines() || columns != _screen[0]->getColumns())
+      bgshellDiag("resize %dx%d (rows x cols)", lines, columns);
 
   _screen[0]->resizeImage(lines,columns);
   _screen[1]->resizeImage(lines,columns);

@@ -27,6 +27,7 @@
 // Own
 #include "TerminalDisplay.h"
 #include "bgshelldirs.h"
+#include "diag.h"
 
 // Hold timings for the copy/paste gesture. The line lights up first, so the
 // finger gets an answer straight away; the menu then opens by itself instead
@@ -72,6 +73,13 @@ static void rlog(const char* what, int a = 0, int b = 0)
   ts << QTime::currentTime().toString("HH:mm:ss.zzz") << ' '
      << QString::fromLatin1(what) << " a=" << a << " b=" << b << '\n';
 }
+
+// How much the shell produced, and when it was last measured.  A full
+// screen program (claude) can send thousands of bytes per second; when the
+// app cannot keep up with that, the UI thread stalls and the platform kills
+// the app.  The rate is written to the diag log every two seconds.
+static qint64 gOutBytes = 0;
+static qint64 gOutLogMs = 0;
 
 // From main.cpp: "OpenSSH_x.y" of the client that PATH resolves to, or
 // 0.0 when the probe failed (keeps us on the conservative option set).
@@ -1728,6 +1736,17 @@ void TerminalDisplay::blinkEvent()
 void TerminalDisplay::refreshWatchdog()
 {
   const qint64 now = QDateTime::currentMSecsSinceEpoch();
+
+  // How fast is the program talking to us?
+  if (gOutLogMs == 0)
+    gOutLogMs = now;
+  else if ((now - gOutLogMs) > 2000)
+  {
+    bgshellDiag("out %lld bytes in %lld ms", (long long)gOutBytes,
+                (long long)(now - gOutLogMs));
+    gOutBytes = 0;
+    gOutLogMs = now;
+  }
   if (_lastTickMs > 0 && (now - _lastTickMs) > 1200)
     rlog("ui-stall", (int)(now - _lastTickMs), 0);  // the UI thread itself was blocked
   _lastTickMs = now;
@@ -3372,6 +3391,85 @@ static int imeSymForEvent(QKeyEvent *event)
 	return 0;
 }
 
+// The Alt layer of the BB10 phone keyboards: the number row lives on the
+// letter keys (Alt+W is 1, Alt+E is 2, Alt+R is 3, Alt+S is 4, Alt+D is 5,
+// Alt+F is 6, Alt+Z is 7, Alt+X is 8, Alt+C is 9) and the punctuation of the
+// layer sits next to them. keyPressEvent sends the character of the layer to
+// the shell; the pinyin engine asks the same table for the digit, because on
+// these keyboards the Alt layer is the only way to reach a digit at all.
+static char altLayerChar(int key)
+{
+	switch (key) {
+	case Qt::Key_Q:      return '#';
+	case Qt::Key_W:      return '1';
+	case Qt::Key_E:      return '2';
+	case Qt::Key_R:      return '3';
+	case Qt::Key_T:      return '(';
+	case Qt::Key_Y:      return ')';
+	case Qt::Key_U:      return '_';
+	case Qt::Key_I:      return '-';
+	case Qt::Key_O:      return '+';
+	case Qt::Key_P:      return '@';
+	case Qt::Key_A:      return '*';
+	case Qt::Key_S:      return '4';
+	case Qt::Key_D:      return '5';
+	case Qt::Key_F:      return '6';
+	case Qt::Key_G:      return '/';
+	case Qt::Key_H:      return ':';
+	case Qt::Key_J:      return ';';
+	case Qt::Key_K:      return '\'';
+	case Qt::Key_L:      return '"';
+	case Qt::Key_Z:      return '7';
+	case Qt::Key_X:      return '8';
+	case Qt::Key_C:      return '9';
+	case Qt::Key_V:      return '?';
+	case Qt::Key_B:      return '!';
+	case Qt::Key_N:      return ',';
+	case Qt::Key_M:      return '.';
+	case Qt::Key_Dollar: return '`';
+	case 0x30:           return '0';
+	default: break;
+	}
+	return 0;
+}
+
+// The digit of the Alt layer, or 0 when the key carries none.
+static char altLayerDigit(int key)
+{
+	const char c = altLayerChar(key);
+	return (c >= '1' && c <= '9') ? c : 0;
+}
+
+// The digit an Alt chord carries. textChar is the ASCII code of the key text
+// when there is one (the layout may already have turned the chord into a
+// character), 0 otherwise. 0 means: the chord carries no digit.
+static char imeAltLayerDigit(int key, int textChar)
+{
+	if (textChar >= '1' && textChar <= '9')
+		return (char)textChar;
+	return altLayerDigit(key);
+}
+
+// A modifier key pressed on its own: no character comes with it. The phone
+// keyboards latch Alt and Shift - the press of the modifier arrives first,
+// the key that follows carries it - so such an event must never be taken
+// for "a key the engine cannot use".
+static bool imeIsModifierOnlyKey(QKeyEvent *event)
+{
+	if (!event->text().isEmpty())
+		return false;
+	switch (event->key()) {
+	case Qt::Key_Alt:
+	case Qt::Key_Control:
+	case Qt::Key_Shift:
+	case Qt::Key_Meta:
+		return true;
+	default:
+		break;
+	}
+	return false;
+}
+
 // `,` `.` `-` `[` `]` `=` are cjk_ime's page keys: while a composition
 // runs the engine turns the candidate strip with them. With a single page
 // there is nothing to turn, and Term50's engine swallows the key anyway,
@@ -3983,6 +4081,8 @@ void TerminalDisplay::showSshDiagnostics()
 // arrive split over two reads, hence the small tail buffer.
 void TerminalDisplay::onSessionOutput(const QString &text)
 {
+    gOutBytes += text.size();
+
 	// --- dropped connection --------------------------------------------
 	// ssh says one of these on its way out; catching it here saves the user
 	// from having to spot the line in the scrollback and retype the command.
@@ -4056,69 +4156,99 @@ bool TerminalDisplay::handleImeKey(QKeyEvent* event)
 	    QDateTime::currentMSecsSinceEpoch() - _imeCommitMs < IME_COMMIT_GUARD_MS)
 		return true;
 
-	// Ctrl / Alt chords keep their meaning (Alt+Enter is the toggle itself),
-	// so they never reach the pinyin buffer.
-	if (event->modifiers() & (Qt::ControlModifier | Qt::AltModifier))
+	// A modifier pressed on its own carries no character, so there is
+	// nothing for the engine to do with it - and it must not end the
+	// composition either.  On the BB10 phone keyboards Alt and Shift latch:
+	// the press of the modifier arrives first (with no modifier set on it),
+	// the key that follows carries the modifier.  Reading that first press
+	// as "a key the engine cannot use" flushed the letters typed so far to
+	// the shell as plain English and dropped the candidates, so the chord
+	// that was meant to pick one found nothing left to pick.
+	if (imeIsModifierOnlyKey(event))
 		return false;
 
-	// The letters are kept aside as they were typed (the engine lowercases
-	// its own pinyin buffer), so Enter can flush them as plain English with
-	// the original case. Nothing is left to flush once the composition is
-	// gone, so a stale buffer can never leak into a later word.
-	if (cjk_ime_preedit(_ime)[0] == '\0')
-		_imeRaw.clear();
+	// Ctrl / Alt chords keep their meaning (Alt+Enter is the toggle itself),
+	// so they never reach the pinyin buffer - with one exception: the Alt
+	// layer of the BB10 phone keyboards *is* the number row (Alt+W is 1,
+	// Alt+E is 2, Alt+R is 3, ... Alt+C is 9), and those chords are the only
+	// way to reach a digit at all.  While a composition runs they pick a
+	// candidate; before this the strip could only be picked by tapping it,
+	// and the chord fell through to the shell as a stray digit.
+	const bool altHeld  = (event->modifiers() & Qt::AltModifier) != 0;
+	const bool ctrlHeld = (event->modifiers() & Qt::ControlModifier) != 0;
+	int sym = 0;
 
-	// While a composition runs the arrows steer the strip: left/right step the
-	// highlight, up/down turn the page. Without a composition they keep their
-	// normal job, so the shell still gets them.
-	if (_imePanel && _imePanel->isOpen() && cjk_ime_preedit(_ime)[0] != '\0') {
-		switch (event->key()) {
-		case Qt::Key_Left:  _imePanel->moveHighlight(-1); event->accept(); return true;
-		case Qt::Key_Right: _imePanel->moveHighlight(+1); event->accept(); return true;
-		case Qt::Key_Up:    onImePageRequested(-1);       event->accept(); return true;
-		case Qt::Key_Down:  onImePageRequested(+1);       event->accept(); return true;
-		default: break;
+	if (altHeld || ctrlHeld) {
+		if (!altHeld || ctrlHeld || cjk_ime_preedit(_ime)[0] == '\0')
+			return false;
+		// The digit arrives either as the key text (the layout already turned
+		// the chord into "1") or only as the key itself.
+		const QString text = event->text();
+		const int textChar = (text.size() == 1) ? (int)text.at(0).unicode() : 0;
+		sym = imeAltLayerDigit(event->key(), textChar);
+		if (sym < '1' || sym > '9')
+			return false;          // not a digit: the chord keeps its own meaning
+	}
+	else {
+		// The letters are kept aside as they were typed (the engine lowercases
+		// its own pinyin buffer), so Enter can flush them as plain English with
+		// the original case. Nothing is left to flush once the composition is
+		// gone, so a stale buffer can never leak into a later word.
+		if (cjk_ime_preedit(_ime)[0] == '\0')
+			_imeRaw.clear();
+
+		// While a composition runs the arrows steer the strip: left/right step the
+		// highlight, up/down turn the page. Without a composition they keep their
+		// normal job, so the shell still gets them.
+		if (_imePanel && _imePanel->isOpen() && cjk_ime_preedit(_ime)[0] != '\0') {
+			switch (event->key()) {
+			case Qt::Key_Left:  _imePanel->moveHighlight(-1); event->accept(); return true;
+			case Qt::Key_Right: _imePanel->moveHighlight(+1); event->accept(); return true;
+			case Qt::Key_Up:    onImePageRequested(-1);       event->accept(); return true;
+			case Qt::Key_Down:  onImePageRequested(+1);       event->accept(); return true;
+			default: break;
+			}
 		}
-	}
 
-	// Space takes the highlighted candidate (candidate 1 when nothing was
-	// steered to), the way a desktop input method does.
-	if (event->key() == Qt::Key_Space && cjk_ime_preedit(_ime)[0] != '\0') {
-		// Take the highlighted candidate. If the strip has nothing laid out
-		// (or is closed) fall back to candidate 1 instead of swallowing the
-		// key - a dead Space makes people hit it again, which is exactly how
-		// junk ended up in the shell.
-		if (_imePanel && _imePanel->hasHighlight())
-			_imePanel->commitHighlighted();
-		else
-			sendImeSym('1');
-		_imeRaw.clear();
-		_imeCommitMs = QDateTime::currentMSecsSinceEpoch();
-		event->accept();
-		return true;
-	}
+		// Space takes the highlighted candidate (candidate 1 when nothing was
+		// steered to), the way a desktop input method does.
+		if (event->key() == Qt::Key_Space && cjk_ime_preedit(_ime)[0] != '\0') {
+			// Take the highlighted candidate. If the strip has nothing laid out
+			// (or is closed) fall back to candidate 1 instead of swallowing the
+			// key - a dead Space makes people hit it again, which is exactly how
+			// junk ended up in the shell.
+			if (_imePanel && _imePanel->hasHighlight())
+				_imePanel->commitHighlighted();
+			else
+				sendImeSym('1');
+			_imeRaw.clear();
+			_imeCommitMs = QDateTime::currentMSecsSinceEpoch();
+			event->accept();
+			return true;
+		}
 
-	// Enter while composing sends what was typed as plain English, exactly as
-	// typed (case included) and with nothing appended: an English word then
-	// needs no 中/EN toggle, and a composition can never be turned into a
-	// Chinese character by accident. No newline is sent - the composition
-	// ends, so a second Enter (nothing composing now) runs the line.
-	if ((event->key() == Qt::Key_Return || event->key() == Qt::Key_Enter) &&
-	    cjk_ime_preedit(_ime)[0] != '\0') {
-		QByteArray raw = _imeRaw.isEmpty()
-		                 ? QByteArray(cjk_ime_preedit(_ime))
-		                 : _imeRaw.toUtf8();
-		imeTraceBytes("ime-enter-flush", raw.constData(), raw.size());
-		writeInputBytes(raw.constData(), raw.size());
-		cjk_ime_reset(_ime);
-		_imeRaw.clear();
-		_imeCommitMs = QDateTime::currentMSecsSinceEpoch();
-		refreshImePanel();
-		event->accept();
-		return true;
-	}
+		// Enter while composing sends what was typed as plain English, exactly as
+		// typed (case included) and with nothing appended: an English word then
+		// needs no 中/EN toggle, and a composition can never be turned into a
+		// Chinese character by accident. No newline is sent - the composition
+		// ends, so a second Enter (nothing composing now) runs the line.
+		if ((event->key() == Qt::Key_Return || event->key() == Qt::Key_Enter) &&
+		    cjk_ime_preedit(_ime)[0] != '\0') {
+			QByteArray raw = _imeRaw.isEmpty()
+			                 ? QByteArray(cjk_ime_preedit(_ime))
+			                 : _imeRaw.toUtf8();
+			imeTraceBytes("ime-enter-flush", raw.constData(), raw.size());
+			writeInputBytes(raw.constData(), raw.size());
+			cjk_ime_reset(_ime);
+			_imeRaw.clear();
+			_imeCommitMs = QDateTime::currentMSecsSinceEpoch();
+			refreshImePanel();
+			event->accept();
+			return true;
+		}
 
-	int sym = imeSymForEvent(event);
+		sym = imeSymForEvent(event);
+	}
 
 	// With no composition running, only a letter may start one.  Everything
 	// else - Space, Backspace, Enter, digits, punctuation, Esc - belongs to the
@@ -4314,37 +4444,10 @@ void TerminalDisplay::keyPressEvent( QKeyEvent* event )
 		// When single Alt was pressed we get key=1000023 and modifiers = 0, we don't need this event here
 		// if then a key pressed we get key=KEY_CODE and modifiers = Qt::AltModifier
 		// Alt was pressed we need to treat it differently -(
-		char c = 0;
-		switch(event->key()){
-		case Qt::Key_Q : c = 35; break;
-		case Qt::Key_W : c = 49; break;
-		case Qt::Key_E : c = 50; break;
-		case Qt::Key_R : c = 51; break;
-		case Qt::Key_T : c = 40; break;
-		case Qt::Key_Y : c = 41; break;
-		case Qt::Key_U : c = 95; break;
-		case Qt::Key_I : c = 45; break;
-		case Qt::Key_O : c = 43; break;
-		case Qt::Key_P : c = 64; break;
-		case Qt::Key_A : c = 42; break;
-		case Qt::Key_S : c = 52; break;
-		case Qt::Key_D : c = 53; break;
-		case Qt::Key_F : c = 54; break;
-		case Qt::Key_G : c = 47; break;
-		case Qt::Key_H : c = 58; break;
-		case Qt::Key_J : c = 59; break;
-		case Qt::Key_K : c = 39; break;
-		case Qt::Key_L : c = 34; break;
-		case Qt::Key_Z : c = 55; break;
-		case Qt::Key_X : c = 56; break;
-		case Qt::Key_C : c = 57; break;
-		case Qt::Key_V : c = 63; break;
-		case Qt::Key_B : c = 33; break;
-		case Qt::Key_N : c = 44; break;
-		case Qt::Key_M : c = 46; break;
-		case Qt::Key_Dollar : c = 96; break;
-		case 0x30 : c = '0'; break;
-		}
+		// The table is altLayerChar() above: on these keyboards the number
+		// row lives on the letter keys (Alt+W is 1, Alt+E is 2, ...) and the
+		// punctuation of the layer sits next to them.
+		const char c = altLayerChar(event->key());
 		if (c != 0)
 			writeInputBytes(&c, 1);
 		return;

@@ -244,6 +244,8 @@ void Screen::NextLine()
 
 void Screen::eraseChars(int n)
 {
+  if (cuY < 0 || cuY >= lines)
+     return;
   if (n == 0) n = 1; // Default
   int p = qMax(0,qMin(cuX+n-1,columns-1));
   clearImage(loc(cuX,cuY),loc(p,cuY),' ');
@@ -251,6 +253,8 @@ void Screen::eraseChars(int n)
 
 void Screen::deleteChars(int n)
 {
+  if (cuY < 0 || cuY >= lines)
+     return;
   Q_ASSERT( n >= 0 );
 
   // always delete at least one char
@@ -272,6 +276,8 @@ void Screen::deleteChars(int n)
 
 void Screen::insertChars(int n)
 {
+  if (cuY < 0 || cuY >= lines)
+     return;
   if (n == 0) n = 1; // Default
 
   if ( screenLines[cuY].size() < cuX )
@@ -398,6 +404,14 @@ void Screen::restoreCursor()
 
 void Screen::resizeImage(int new_lines, int new_columns)
 {
+  // Second line of defence (Emulation::setImageSize() clamps already): a
+  // screen without a single row leaves the cursor at -1, and the next
+  // character would be written to screenLines[-1].
+  if (new_lines < 1)     new_lines = 1;
+  if (new_columns < 1)   new_columns = 1;
+  if (new_lines > 1000)   new_lines = 1000;
+  if (new_columns > 1000) new_columns = 1000;
+
   if ((new_lines==lines) && (new_columns==columns)) return;
 
   if (cuY > new_lines-1)
@@ -428,8 +442,8 @@ void Screen::resizeImage(int new_lines, int new_columns)
 
   lines = new_lines;
   columns = new_columns;
-  cuX = qMin(cuX,columns-1);
-  cuY = qMin(cuY,lines-1);
+  cuX = qBound(0,cuX,columns-1);
+  cuY = qBound(0,cuY,lines-1);
 
   // FIXME: try to keep values, evtl.
   tmargin=0;
@@ -773,6 +787,13 @@ void Screen::ShowCharacter(unsigned short c)
   // This has impact on the assumption of valid cursor positions.
   // We indicate the fact that a newline has to be triggered by
   // putting the cursor one right to the last column of the screen.
+
+  // The cursor has to be inside the screen.  Everything below writes to
+  // screenLines[cuY] without a further check, so a cursor outside the
+  // screen (a resize or a scroll region that did not fit) would corrupt
+  // the heap - and that kills the whole app, not just the terminal.
+  if (cuY < 0 || cuY >= lines || cuX < 0)
+     return;
 
   int w = konsole_wcwidth(c);
 
