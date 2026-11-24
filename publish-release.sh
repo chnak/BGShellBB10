@@ -55,7 +55,7 @@ body = f"""**{name} v{ver} (build {bid})**
 
 | 文件 | 大小 | MD5 |
 |---|---|---|
-| `{fname}` | {size:,} B | `{md5}` |
+| `{fname}` | {int(size):,} B | `{md5}` |
 
 安装：`blackberry-deploy -installApp -device <IP> -password <PW> {fname}`
 """
