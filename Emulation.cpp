@@ -52,6 +52,9 @@
 #include "TerminalCharacterDecoder.h"
 #include "ScreenWindow.h"
 
+// Colour emoji
+#include "emoji_atlas.h"
+
 using namespace Konsole;
 
 /* ------------------------------------------------------------------------- */
@@ -273,6 +276,13 @@ void Emulation::receiveData(const char* text, int length)
 	bufferedUpdate();
     	
     QString unicodeText = _decoder->toUnicode(text,length);
+
+	// Colour emoji cannot be drawn as glyphs here (Qt 4 has no colour font
+	// support and the FreeType in the BB10 NDK is too old for it), so they are
+	// swapped for a private use character that the display resolves out of a
+	// pre-rendered atlas.  Everything downstream keeps seeing a plain double
+	// width character.
+	unicodeText = EmojiAtlas::encode(unicodeText);
 
 	//send characters to terminal emulator
 	for (int i=0;i<unicodeText.length();i++)

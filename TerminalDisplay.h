@@ -690,6 +690,12 @@ private:
     // draws the characters or line graphics in a text fragment
     void drawCharacters(QPainter& painter, const QRect& rect,  const QString& text, 
                                            const Character* style, bool invertCharacterColor);
+    // draws one colour emoji out of the pre-rendered atlas instead of a glyph.
+    // 'gridX'/'gridY' is the cell the emoji starts in, 'columns' is how many
+    // cells it covers (two, like every other double width character) and
+    // 'atlasIndex' is the cell in the atlas.
+    void drawEmojiFragment(QPainter& painter, int gridX, int gridY, int columns,
+                            int atlasIndex, const Character* style);
     // draws a string of line graphics
 	void drawLineCharString(QPainter& painter, int x, int y, 
                             const QString& str, const Character* attributes);

@@ -28,6 +28,7 @@
 #include "TerminalDisplay.h"
 #include "bgshelldirs.h"
 #include "diag.h"
+#include "emoji_atlas.h"
 
 // Hold timings for the copy/paste gesture. The line lights up first, so the
 // finger gets an answer straight away; the menu then opens by itself instead
@@ -849,6 +850,88 @@ void TerminalDisplay::drawTextFragment(QPainter& painter ,
     painter.restore();
 }
 
+// Colour emoji are not glyphs: Qt 4 cannot rasterise a colour font and the
+// FreeType in the BB10 NDK is too old for COLR/CPAL/CBDT as well.  The emoji
+// are therefore blitted out of an atlas that was rendered on the host (see
+// tools/make-emoji-atlas.py).
+//
+// The painter is put back into device coordinates first.  The surrounding
+// code scales the painter for double width and double height lines, and a
+// stretched emoji would look wrong; the cell is placed with the same
+// arithmetic the text of that cell would have used.
+void TerminalDisplay::drawEmojiFragment(QPainter& painter,
+                                        int gridX, int gridY, int columns,
+                                        int atlasIndex, const Character* style)
+{
+    const QImage& atlas = EmojiAtlas::atlasImage();
+    if (atlas.isNull())
+        return;
+
+    const QRect source = EmojiAtlas::cellRect(atlasIndex);
+    if (!source.isValid())
+        return;
+
+    int scaleX = 1;
+    int scaleY = 1;
+    if (gridY < (int)_lineProperties.size()) {
+        if (_lineProperties[gridY] & LINE_DOUBLEWIDTH)
+            scaleX = 2;
+        if (_lineProperties[gridY] & LINE_DOUBLEHEIGHT)
+            scaleY = 2;
+    }
+
+    const int cellWidth = _fontWidth * columns * scaleX;
+    const int cellHeight = _fontHeight * scaleY;
+
+    // The same positions the text of that cell would have been drawn at, see
+    // drawContents() for the derivation.
+    const int left = textOriginX() + _fontWidth * gridX
+                     - (scaleX == 2 ? _fontWidth * columns / 2 : 0);
+    const int top = contentsRect().topLeft().y() + _topMargin + _fontHeight * gridY
+                    + _fontHeight / 2 - scaleY * _fontHeight / 2;
+
+    painter.save();
+    painter.resetMatrix();
+
+    const QRect cell(left, top, cellWidth, cellHeight);
+
+    const QColor foregroundColor = style->foregroundColor.color(_colorTable);
+    const QColor backgroundColor = style->backgroundColor.color(_colorTable);
+
+    // draw background if different from the display's background color
+    if (backgroundColor != palette().background().color())
+        drawBackground(painter, cell, backgroundColor, false /* do not use transparency */);
+
+    // draw cursor shape if the current character is the cursor
+    bool invertCharacterColor = false;
+    const bool cursorHere = (style->rendition & RE_CURSOR) != 0;
+    if (cursorHere)
+        drawCursor(painter, cell, foregroundColor, backgroundColor, invertCharacterColor);
+
+    // Keep the emoji square and centred in the cell.
+    const int side = qMin(cell.width(), cell.height());
+    const QRect target(cell.left() + (cell.width() - side) / 2,
+                       cell.top() + (cell.height() - side) / 2,
+                       side, side);
+    painter.setRenderHint(QPainter::SmoothPixmapTransform, true);
+    painter.drawImage(target, atlas, source);
+
+    // A filled block cursor would be hidden completely under the emoji, so
+    // its outline is drawn once more on top of it.
+    if (cursorHere && !_cursorBlinking && hasFocus() && _cursorShape == BlockCursor)
+    {
+        QRect cursorRect = cell;
+        cursorRect.setHeight(_fontHeight - _lineSpacing - 1);
+        const int penWidth = qMax(1, painter.pen().width());
+        painter.drawRect(cursorRect.adjusted(penWidth / 2,
+                                             penWidth / 2,
+                                             - penWidth / 2 - penWidth % 2,
+                                             - penWidth / 2 - penWidth % 2));
+    }
+
+    painter.restore();
+}
+
 void TerminalDisplay::setRandomSeed(uint randomSeed) { _randomSeed = randomSeed; }
 uint TerminalDisplay::randomSeed() const { return _randomSeed; }
 
@@ -1632,13 +1715,31 @@ void TerminalDisplay::drawContents(QPainter &paint, const QRect &rect)
       if ((x+len < _usedColumns) && (!_image[loc(x+len,y)].character))
         len++; // Adjust for trailing part of multi-column character
 
-   	     bool save__fixedFont = _fixedFont;
+	     bool save__fixedFont = _fixedFont;
          if (lineDraw)
             _fixedFont = false;
          if (doubleWidth)
             _fixedFont = false;
          QString unistr(disstrU,p);
 		 
+		 // A colour emoji is a private use character that stands in for the
+		 // real one (see emoji_atlas.h).  It has no glyph, so it is blitted
+		 // out of the atlas instead of being drawn as text.  The merge above
+		 // always stops at a double width character, so an emoji is the one
+		 // and only character of its fragment.
+		 const bool isEmoji = (p == 1) && EmojiAtlas::isPlaceholder(unistr.at(0).unicode());
+
+		 if (isEmoji)
+		 {
+			 drawEmojiFragment( paint,
+					               x,
+					               y,
+					               len,
+					               EmojiAtlas::indexFor(unistr.at(0).unicode()),
+					               &_image[loc(x,y)] );
+		 }
+		 else
+		 {
 		 if (y < _lineProperties.size())
 		 {
 			if (_lineProperties[y] & LINE_DOUBLEWIDTH) {
@@ -1652,9 +1753,9 @@ void TerminalDisplay::drawContents(QPainter &paint, const QRect &rect)
 
 		 //calculate the area in which the text will be drawn
 		 QRect textArea = QRect( tLx+_fontWidth*x , 
-					_topMargin+tLy+_fontHeight*y , 
-					_fontWidth*len, 
-					_fontHeight);
+				_topMargin+tLy+_fontHeight*y ,
+				_fontWidth*len,
+				_fontHeight);
 		
 		 //move the calculated area to take account of scaling applied to the painter.
 		 //the position of the area from the origin (0,0) is scaled 
@@ -1674,6 +1775,7 @@ void TerminalDisplay::drawContents(QPainter &paint, const QRect &rect)
 					    	&_image[loc(x,y)] ); //, 
 						    //0, 
 						    //!_isPrinting );
+		 }
          
 		 _fixedFont = save__fixedFont;
      

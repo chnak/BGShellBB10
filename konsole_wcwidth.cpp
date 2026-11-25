@@ -104,7 +104,8 @@ int konsole_wcwidth(quint16 ucs)
     { 0x17C9, 0x17D3 }, { 0x180B, 0x180E }, { 0x18A9, 0x18A9 },
     { 0x200B, 0x200F }, { 0x202A, 0x202E }, { 0x206A, 0x206F },
     { 0x20D0, 0x20E3 }, { 0x302A, 0x302F }, { 0x3099, 0x309A },
-    { 0xFB1E, 0xFB1E }, { 0xFE20, 0xFE23 }, { 0xFEFF, 0xFEFF },
+    { 0xFB1E, 0xFB1E }, { 0xFE00, 0xFE0F }, { 0xFE20, 0xFE23 },
+    { 0xFEFF, 0xFEFF },
     { 0xFFF9, 0xFFFB }
   };
 
@@ -120,6 +121,12 @@ int konsole_wcwidth(quint16 ucs)
     return 0;
 
   /* if we arrive here, ucs is not a combining or C0/C1 control character */
+
+  /* Colour emoji are swapped for a private use character before they reach
+   * the screen (see emoji_atlas.h).  Like the emoji they stand for they take
+   * two columns.  The range has to match EMOJI_ATLAS_PUA_BASE/END. */
+  if (ucs >= 0xE000 && ucs < 0xE200)
+    return 2;
 
   return 1 +
     (ucs >= 0x1100 &&

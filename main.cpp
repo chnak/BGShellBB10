@@ -47,6 +47,7 @@ int gSshMinor = 0;
 #include "csessiontabs.h"
 #include "bgshelldirs.h"
 #include "diag.h"
+#include "emoji_atlas.h"
 
 // Headers for trackpad event handling
 #include <screen/screen.h>
@@ -653,6 +654,12 @@ int main(int argc, char *argv[])
     bgshellDiagHeartbeat();
 
     gTerminalFontFamily = installBundledFont();
+
+    // The colour emoji atlas.  Qt 4 cannot draw a colour font, so the emoji
+    // are blitted out of an image that was rendered on the host (see
+    // tools/make-emoji-atlas.py).  When the atlas is missing the terminal
+    // keeps showing the emoji as monochrome glyphs.
+    EmojiAtlas::init();
 
     // One visual language for every piece of chrome: menu, settings, command
     // panel, dialogs (see uitheme.h). Applied after the bundled font is

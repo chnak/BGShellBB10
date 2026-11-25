@@ -26,6 +26,9 @@
 // Own
 #include "TerminalCharacterDecoder.h"
 
+// Colour emoji
+#include "emoji_atlas.h"
+
 // Qt
 #include <QtCore/QTextStream>
 
@@ -84,6 +87,18 @@ void PlainTextDecoder::decodeLine(const Character* const characters, int count, 
 
 	for (int i=0;i<outputCount;i++)
 	{
+		// A colour emoji is stored as a private use character that stands in
+		// for it (see emoji_atlas.h); put the real emoji back so that what is
+		// copied is what was printed.  The trailing half of the double width
+		// cell is dropped along with it.
+		const QString emoji = EmojiAtlas::textFor(characters[i].character);
+		if (!emoji.isEmpty())
+		{
+			plainText.append(emoji);
+			if (i+1 < outputCount && characters[i+1].character == 0)
+				i++;
+			continue;
+		}
 		plainText.append( QChar(characters[i].character) );
 	}
 
@@ -139,6 +154,15 @@ void HTMLDecoder::decodeLine(const Character* const characters, int count, LineP
 	{
 		QChar ch(characters[i].character);
 
+		// A colour emoji is stored as a private use character that stands in
+		// for it (see emoji_atlas.h); put the real emoji back.  The trailing
+		// half of the double width cell is skipped along with it, but the
+		// style of the emoji itself is the one of the cell it starts in.
+		QString emoji = EmojiAtlas::textFor(ch.unicode());
+		int next = i;
+		if (!emoji.isEmpty() && i+1 < count && characters[i+1].character == 0)
+			next = i+1;
+
 		//check if appearance of character is different from previous char
 		if ( characters[i].rendition != _lastRendition  ||
 		     characters[i].foregroundColor != _lastForeColor  ||
@@ -184,6 +208,15 @@ void HTMLDecoder::decodeLine(const Character* const characters, int count, LineP
 		else
 			spaceCount = 0;
 		
+
+		if (!emoji.isEmpty())
+		{
+			//an emoji is never whitespace
+			spaceCount = 0;
+			text.append(emoji);
+			i = next;
+			continue;
+		}
 
 		//output current character
 		if (spaceCount < 2)
